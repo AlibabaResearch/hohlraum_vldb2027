@@ -1,0 +1,73 @@
+{
+  "seeds": [
+    272015,
+    272016,
+    272017
+  ],
+  "warmup_seconds": 3600,
+  "measurement_seconds": 14400,
+  "cold_cache_after_warmup": true,
+  "write_budget_bytes": 640000000000,
+  "idle_timeout_seconds": 1200,
+  "queue_delay_seconds": 10,
+  "waiting_queue_limit": 8,
+  "ttft_includes_external_wait": true,
+  "agentx": {
+    "sample_roots": 150,
+    "concurrency": [
+      6,
+      13,
+      22
+    ]
+  },
+  "playing": {
+    "sample_roots": 65,
+    "provider_pool_counts": [
+      65,
+      65,
+      65
+    ],
+    "concurrency": [
+      20,
+      32,
+      40
+    ],
+    "additional_concurrency": [
+      34,
+      35
+    ]
+  },
+  "status": "current evaluation protocol; load points not all calibrated to 3/5/10-second targets",
+  "scoring_clock": "client_ready_to_completion_excluded",
+  "admission_threshold": 0.7,
+  "admission_period_seconds": 1800,
+  "admission_window_seconds": 1800,
+  "capacity_control": {
+    "period_s": 300,
+    "history_windows": 8,
+    "observation_windows": 2,
+    "pressure_windows": 2,
+    "additional_wait_windows": 2,
+    "failure_cooldown_windows": 4,
+    "min_read_fraction": 0.25,
+    "tiers_gb": [
+      1,
+      10,
+      15,
+      30
+    ],
+    "expansion_thresholds": [
+      0,
+      0.01,
+      0.05,
+      0.1
+    ],
+    "contraction_thresholds": [
+      0,
+      0.01,
+      0.05,
+      0.1
+    ],
+    "min_expansion_windows": 4
+  }
+}

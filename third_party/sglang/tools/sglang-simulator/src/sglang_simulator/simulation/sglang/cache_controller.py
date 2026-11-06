@@ -6,6 +6,35 @@ from sglang_simulator.simulation.manager import ConfigManager, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 
 
+def prefetch_progress(controller, operation, tokens, duration):
+    from sglang_simulator.simulation.read_routes import advance_read
+    return advance_read(controller, operation, tokens, duration,
+                        C_HiCacheController.KV_CACHE_BYTES,
+                        C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
+                        C_HiCacheController.calc_prefetch_pages,
+                        ConfigManager.get_platform_config())
+
+
+def publish_prefetch_completion(controller, operation):
+    """Hand a completed Unified read to the native scheduler ACK drain.
+
+    Legacy operations retain their request-polling completion path. This
+    changes neither transfer progress nor the simulator clock.
+    """
+    if not hasattr(operation, "ack_releases_incomplete_host_indices"):
+        return
+    if getattr(operation, "_sim_completion_ack_sent", False):
+        return
+    from sglang.srt.managers.cache_controller import PrefetchAck
+
+    controller.ack_prefetch_queue.put(
+        PrefetchAck(rid=operation.request_id, operation=operation,
+                    completed_tokens=operation.completed_tokens,
+                    completed_req=True)
+    )
+    operation._sim_completion_ack_sent = True
+
+
 class C_HiCacheController(BaseHook):
     HOOK_CLASS_NAME = "HiCacheController"
     HOOK_MODULE_NAME = "sglang.srt.managers.cache_controller"
@@ -157,12 +186,8 @@ class C_HiCacheController(BaseHook):
                 else:
                     storage_hit_count = chunked_prefetch_operation["storage_hit_count"]
                     completed_tokens, prefetch_dur = (
-                        C_HiCacheController.calc_prefetch_pages(
-                            (storage_hit_count - operation.completed_tokens),
-                            C_HiCacheController.KV_CACHE_BYTES,
-                            remain_dur,
-                            C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
-                        )
+                        prefetch_progress(self, operation,
+                            storage_hit_count - operation.completed_tokens, remain_dur)
                     )
                     if (
                         completed_tokens
@@ -173,6 +198,7 @@ class C_HiCacheController(BaseHook):
                     else:
                         operation.completed_tokens = int(storage_hit_count)
                         operation.mark_terminate()
+                        publish_prefetch_completion(self, operation)
                         remain_dur -= prefetch_dur
                         setattr(self, "chunked_prefetch_operation", None)
                         # Release host memory after current operation is finished
@@ -208,12 +234,7 @@ class C_HiCacheController(BaseHook):
 
                     storage_hit_count = len(operation.host_indices)
                     completed_tokens, prefetch_dur = (
-                        C_HiCacheController.calc_prefetch_pages(
-                            storage_hit_count,
-                            C_HiCacheController.KV_CACHE_BYTES,
-                            remain_dur,
-                            C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
-                        )
+                        prefetch_progress(self, operation, storage_hit_count, remain_dur)
                     )
                     if completed_tokens < storage_hit_count:
                         # Continue to prefetch data next time.
@@ -233,6 +254,7 @@ class C_HiCacheController(BaseHook):
                         )
                         # TODO: Track the prefetch operation according to the global clock
                         operation.mark_terminate()
+                        publish_prefetch_completion(self, operation)
                         remain_dur -= prefetch_dur
 
                 except Empty:
@@ -252,8 +274,11 @@ class C_HiCacheController(BaseHook):
         def wrapped_terminate_prefetch(self, operator):
             result = original_terminate_prefetch(self, operator)
             # This value may be a float if prefetch progress is interrupted mid-transfer.
-            result = (int(result[0]), result[1])
-            # operation.completed_tokens, operation.hash_value = result
+            # Native consumers read the operation, not only this return tuple.
+            # Publish complete pages at termination; fractional service stays internal.
+            completed = int(result[0]) // self.page_size * self.page_size
+            operator.completed_tokens = completed
+            result = (completed, result[1])
             req_stats = request_stats_manager.get_req_stats(operator.request_id)
             req_stats.final_storage_hit_len = result[0]
             return result
@@ -267,6 +292,9 @@ class C_HiCacheController(BaseHook):
 
         target.__init__ = wrapped_init
         target.prefetch_thread_func = override_prefetch_thread_func
+        # Unified HiCache split real I/O into an auxiliary worker. Both workers
+        # must yield queue ownership to the existing simulated transfer loop.
+        target.prefetch_io_aux_func = override_prefetch_thread_func
         target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
         target.handle_prefetch_operation = handle_prefetch_operation
@@ -309,3 +337,7 @@ class C_HybridCacheController(BaseHook):
 
         target.__init__ = wrapped_init
         target._storage_hit_query = wrapped_storage_hit_query
+        # Unified overrides this worker, so the base hook cannot replace it
+        # through inheritance. Reuse the already hooked native simulation worker.
+        from sglang.srt.managers.cache_controller import HiCacheController
+        target.backup_thread_func = HiCacheController.backup_thread_func

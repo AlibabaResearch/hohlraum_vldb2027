@@ -530,6 +530,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_metric_labels=self.extra_metric_labels,
             )
 
+        import os
+        if os.environ.get('HOHLRAUM_CONFIG'):
+            from hohlraum.core.staging_storage import attach
+            attach(self, os.environ['HOHLRAUM_CONFIG'])
+
     def register_sidecar_pool(
         self, spec: SidecarPoolSpec, entry: Optional[PoolEntry] = None
     ) -> None:

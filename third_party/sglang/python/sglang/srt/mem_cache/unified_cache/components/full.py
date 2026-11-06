@@ -237,6 +237,9 @@ class FullComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        *,
+        leaf_handler=None,
+        should_stop=None,
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
@@ -246,11 +249,17 @@ class FullComponent(TreeComponent):
         ]
         heapq.heapify(heap)
         ct = self.component_type
-        while tracker[ct] < num_tokens and heap:
+        while heap and (not should_stop() if should_stop is not None else tracker[ct] < num_tokens):
             _, x = heapq.heappop(heap)
             if x not in self.tree_core.evictable_host_leaves:
                 continue
-            self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+            # Optional external owner: None uses native eviction, True handled
+            # this leaf, False stops under backpressure without skipping it.
+            handled = leaf_handler(x) if leaf_handler is not None else None
+            if handled is False:
+                break
+            if handled is None:
+                self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
             if (
                 x.parent is not None
                 and x.parent in self.tree_core.evictable_host_leaves

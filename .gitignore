@@ -5,11 +5,14 @@ __pycache__/
 .venv/
 build/
 *.egg-info/
-hohlraum/preprocessing/processed/
-hohlraum/preprocessing/tokenizer/
-hohlraum/policy_replay/data/
-hohlraum/policy_replay/runs/
-hohlraum/policy_replay/releases/
+hohlraum/experiments/backends/policy_replay/data/
+hohlraum/experiments/backends/policy_replay/runs/
+hohlraum/experiments/backends/policy_replay/releases/
 runs/
 private/
 *.local.json
+
+# Keep experiment payloads outside the code repository.
+hohlraum/experiments/preprocessing/data/
+
+.venv-reproduce/

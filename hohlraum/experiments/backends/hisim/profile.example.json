@@ -1,0 +1,36 @@
+{
+  "sim_config": {
+    "platform": {
+      "accelerator": {
+        "name": null
+      },
+      "disk_capacity_gb": null,
+      "disk_read_bandwidth_gb": null,
+      "disk_write_bandwidth_gb": null,
+      "memory_capacity_gb": null,
+      "memory_read_bandwidth_gb": null,
+      "memory_write_bandwidth_gb": null,
+      "num_device_per_node": null
+    },
+    "predictor": {
+      "name": null,
+      "database_path": null
+    },
+    "scheduler": {
+      "tp_size": null,
+      "ep_size": 1,
+      "dp_size": 1,
+      "data_type": "BF16",
+      "kv_cache_data_type": "FP8",
+      "backend_version": null,
+      "max_total_tokens": null,
+      "backend_name": "sglang"
+    }
+  },
+  "server_args": {
+    "model_path": null,
+    "context_length": 990144,
+    "max_total_tokens": null,
+    "hicache_size": null
+  }
+}

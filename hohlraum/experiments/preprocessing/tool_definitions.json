@@ -1,0 +1,86 @@
+{
+  "client_version": "0.130.0",
+  "scope": "Verified partial tool set, not full request recovery",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "write_stdin",
+        "description": "Writes characters to an existing unified exec session and returns recent output.",
+        "strict": false,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "chars": {
+              "type": "string",
+              "description": "Bytes to write to stdin (may be empty to poll)."
+            },
+            "max_output_tokens": {
+              "type": "number",
+              "description": "Maximum number of tokens to return. Excess output will be truncated."
+            },
+            "session_id": {
+              "type": "number",
+              "description": "Identifier of the running unified exec session."
+            },
+            "yield_time_ms": {
+              "type": "number",
+              "description": "How long to wait (in milliseconds) for output before yielding."
+            }
+          },
+          "required": [
+            "session_id"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "update_plan",
+        "description": "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n",
+        "strict": false,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "explanation": {
+              "type": "string"
+            },
+            "plan": {
+              "type": "array",
+              "description": "The list of steps",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "description": "One of: pending, in_progress, completed"
+                  },
+                  "step": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "step",
+                  "status"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "plan"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "excluded": {
+    "exec_command": "Runtime feature flags change input schema; exact flags not in transcript.",
+    "kimi": "Client release unidentified; active tool names alone do not establish definitions.",
+    "claude": "Release 2.1.116 identified; runtime tool schemas and activation unavailable."
+  },
+  "serialization_note": "OpenAI function schemas adapted to Qwen tools input. output_schema excluded: upstream ResponsesApiTool marks it serde(skip)."
+}

@@ -1,0 +1,157 @@
+{
+  "cases": [
+    {
+      "seed": 20261012,
+      "workload": "agentx",
+      "blocks": 4524358,
+      "sessions": 1673,
+      "requests": 80535,
+      "end_seconds": 1002601,
+      "tasks": 288,
+      "arrival_interval_s": 40.0,
+      "active_root_limit": 12,
+      "idle_release_s": 1800.0,
+      "capacities": {
+        "80": 1408,
+        "90": 2031,
+        "99": 5494
+      }
+    },
+    {
+      "seed": 20261012,
+      "workload": "playing",
+      "blocks": 13792498,
+      "sessions": 288,
+      "requests": 107957,
+      "end_seconds": 47241,
+      "tasks": 288,
+      "arrival_interval_s": 40.0,
+      "active_root_limit": 34,
+      "idle_release_s": 1800.0,
+      "capacities": {
+        "80": 2803,
+        "90": 3245,
+        "99": 4072
+      }
+    },
+    {
+      "seed": 20261013,
+      "workload": "agentx",
+      "blocks": 4144194,
+      "sessions": 1449,
+      "requests": 67450,
+      "end_seconds": 977081,
+      "tasks": 288,
+      "arrival_interval_s": 40.0,
+      "active_root_limit": 16,
+      "idle_release_s": 1800.0,
+      "capacities": {
+        "80": 1613,
+        "90": 2265,
+        "99": 6082
+      }
+    },
+    {
+      "seed": 20261013,
+      "workload": "playing",
+      "blocks": 14156992,
+      "sessions": 288,
+      "requests": 110164,
+      "end_seconds": 47188,
+      "tasks": 288,
+      "arrival_interval_s": 40.0,
+      "active_root_limit": 34,
+      "idle_release_s": 1800.0,
+      "capacities": {
+        "80": 2712,
+        "90": 3147,
+        "99": 3975
+      }
+    },
+    {
+      "seed": 20261014,
+      "workload": "agentx",
+      "blocks": 4151561,
+      "sessions": 1616,
+      "requests": 72362,
+      "end_seconds": 1016121,
+      "tasks": 288,
+      "arrival_interval_s": 40.0,
+      "active_root_limit": 16,
+      "idle_release_s": 1800.0,
+      "capacities": {
+        "80": 1603,
+        "90": 2266,
+        "99": 6047
+      }
+    },
+    {
+      "seed": 20261014,
+      "workload": "playing",
+      "blocks": 13517481,
+      "sessions": 288,
+      "requests": 108807,
+      "end_seconds": 48028,
+      "tasks": 288,
+      "arrival_interval_s": 40.0,
+      "active_root_limit": 32,
+      "idle_release_s": 1800.0,
+      "capacities": {
+        "80": 2652,
+        "90": 3110,
+        "99": 4015
+      }
+    }
+  ],
+  "thresholds": [
+    0,
+    0.1,
+    0.3,
+    0.5,
+    0.7,
+    0.9,
+    1
+  ],
+  "staging_fractions": [
+    0,
+    0.1,
+    0.25,
+    0.4,
+    0.5,
+    0.6,
+    0.8
+  ],
+  "larc_ratios": [
+    0.1,
+    0.2,
+    0.4,
+    0.8,
+    1.6,
+    3.2,
+    6.4,
+    16,
+    64,
+    256
+  ],
+  "access_counts": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    8,
+    12,
+    20
+  ],
+  "budget_starts": [
+    0.1,
+    0.5,
+    0.7,
+    0.9,
+    1
+  ],
+  "dwpd": [
+    1,
+    3
+  ]
+}
