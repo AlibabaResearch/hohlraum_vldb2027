@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+.venv/
+build/
+*.egg-info/
+hohlraum/preprocessing/processed/
+hohlraum/preprocessing/tokenizer/
+hohlraum/policy_replay/data/
+hohlraum/policy_replay/runs/
+hohlraum/policy_replay/releases/
+runs/
+private/
+*.local.json
