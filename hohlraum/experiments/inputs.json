@@ -1,38 +1,49 @@
 {
+  "sources": {
+    "playing": {
+      "url": "https://huggingface.co/datasets/nacloos/machine-playing-paper",
+      "reconstruction": "hohlraum/experiments/preprocessing/rebuild_playing_trace.py",
+      "runtime_input": "Processed request lengths and prefix-block identities; original logs are not required for replay."
+    },
+    "agentx": {
+      "url": "https://inferencex.semianalysis.com/agentx",
+      "runtime_input": "Selected request rows and dependency DAGs; the supplied selections are directly replayable."
+    }
+  },
   "datasets": {
     "playing": {
       "272015": {
-        "rows": "../hohlraum-data/processed/playing/s272015/calibration_rows.json",
+        "rows": "data/processed/playing/s272015/calibration_rows.json",
         "seed": 272015,
         "rows_sha256": "a9bce210f8888354863d3cde93f560062ab200b4ed8d1abbdd9c4a73b8691034",
         "rebuild": {
           "kind": "playing-balanced",
-          "raw": "../hohlraum-data/raw/playing",
-          "tokenizer": "../hohlraum-data/tokenizer",
+          "raw": "data/raw/playing",
+          "tokenizer": "data/tokenizer",
           "seed": 272015,
           "mean_arrival": 15
         }
       },
       "272016": {
-        "rows": "../hohlraum-data/processed/playing/s272016/calibration_rows.json",
+        "rows": "data/processed/playing/s272016/calibration_rows.json",
         "seed": 272016,
         "rows_sha256": "d75eef038ca464c4bd636fb91836e1c142229998c180ff2b0a1ab49cd0418667",
         "rebuild": {
           "kind": "playing-balanced",
-          "raw": "../hohlraum-data/raw/playing",
-          "tokenizer": "../hohlraum-data/tokenizer",
+          "raw": "data/raw/playing",
+          "tokenizer": "data/tokenizer",
           "seed": 272016,
           "mean_arrival": 15
         }
       },
       "272017": {
-        "rows": "../hohlraum-data/processed/playing/s272017/calibration_rows.json",
+        "rows": "data/processed/playing/s272017/calibration_rows.json",
         "seed": 272017,
         "rows_sha256": "ac809bacf15bd6cd5d219204488d133a537a2a13d49dffa77ca442e218054b14",
         "rebuild": {
           "kind": "playing-balanced",
-          "raw": "../hohlraum-data/raw/playing",
-          "tokenizer": "../hohlraum-data/tokenizer",
+          "raw": "data/raw/playing",
+          "tokenizer": "data/tokenizer",
           "seed": 272017,
           "mean_arrival": 15
         }
@@ -40,31 +51,26 @@
     },
     "agentx": {
       "272015": {
-        "rows": "../hohlraum-data/processed/agentx/s272015/selected_rows.json",
+        "rows": "data/processed/agentx/s272015/selected_rows.json",
         "seed": 272015,
         "rows_sha256": "da114198212748040db104e2d7c76c547ac2ae3a10cb1a687f8fb95744a849b3",
-        "dependencies": "../hohlraum-data/processed/agentx/s272015/dependencies.json",
+        "dependencies": "data/processed/agentx/s272015/dependencies.json",
         "dependencies_sha256": "a1c11c8457679b793e885373dad72d099be1415ef42ed0f718ae4c672ebe871b"
       },
       "272016": {
-        "rows": "../hohlraum-data/processed/agentx/s272016/selected_rows.json",
+        "rows": "data/processed/agentx/s272016/selected_rows.json",
         "seed": 272016,
         "rows_sha256": "25534151ccb08032857b7ee3f1198d740d35d0f481304f5ab18b359c7c3c9ef2",
-        "dependencies": "../hohlraum-data/processed/agentx/s272016/dependencies.json",
+        "dependencies": "data/processed/agentx/s272016/dependencies.json",
         "dependencies_sha256": "0fcfb6790a3f25bf268b49d19d5d64070fdb429e8c25a5fc91959ce3cd260486"
       },
       "272017": {
-        "rows": "../hohlraum-data/processed/agentx/s272017/selected_rows.json",
+        "rows": "data/processed/agentx/s272017/selected_rows.json",
         "seed": 272017,
         "rows_sha256": "33a7bdaba94134acee3699c42716f597f5ec12c8dab0ac57887e94977160c0ef",
-        "dependencies": "../hohlraum-data/processed/agentx/s272017/dependencies.json",
+        "dependencies": "data/processed/agentx/s272017/dependencies.json",
         "dependencies_sha256": "e309ad0c573fa9fcdcfbc4558a40e794e150e0980acce5951aa45b08512a4822"
       }
     }
-  },
-  "native_server_args": "/path/to/native-server-args.json",
-  "ssd_directory": "/path/on/ssd",
-  "hisim_profile": "/path/to/reference-hisim-profile.json",
-  "priors": "/path/to/priors",
-  "policy_data": "/path/to/frozen-policy-inputs"
+  }
 }

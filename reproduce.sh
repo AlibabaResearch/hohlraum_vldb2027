@@ -1,4 +1,3 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-exec "${PYTHON:-python3}" -m hohlraum.experiments.reproduce "$@"
+exec "$(dirname -- "${BASH_SOURCE[0]}")/run.sh" "$@"

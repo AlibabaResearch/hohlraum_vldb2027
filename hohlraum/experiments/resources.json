@@ -1,0 +1,32 @@
+{
+  "serving": {
+    "filename": "hohlraum-serving-data-v1.tar.gz",
+    "url": "https://github.com/AlibabaResearch/hohlraum_vldb2027/releases/download/data-v1/hohlraum-serving-data-v1.tar.gz",
+    "sha256": "2e4ac7ac0afa1b0aa9d55bb68513e181dfe124e91a9e2f22bce93b84abd9c3ca",
+    "required_paths": [
+      "processed",
+      "runtime/priors"
+    ],
+    "bytes": 28433292
+  },
+  "policy": {
+    "filename": "hohlraum-policy-data-v1.tar.gz",
+    "url": "https://github.com/AlibabaResearch/hohlraum_vldb2027/releases/download/data-v1/hohlraum-policy-data-v1.tar.gz",
+    "sha256": "71af889f2ad5bfeb8057bdba3543e99a2a082c35447dba8a1e595d8dfa3ffbe7",
+    "required_paths": [
+      "policy/streams",
+      "policy/models"
+    ],
+    "bytes": 100033279
+  },
+  "hisim": {
+    "filename": "hohlraum-hisim-profile-v1.tar.gz",
+    "url": "https://github.com/AlibabaResearch/hohlraum_vldb2027/releases/download/data-v1/hohlraum-hisim-profile-v1.tar.gz",
+    "sha256": "745e36e29c8a87070e438fd957ab94be0a7966f63881797e9170144564d95e26",
+    "required_paths": [
+      "runtime/hisim-profile.json",
+      "runtime/predictor"
+    ],
+    "bytes": 363119
+  }
+}

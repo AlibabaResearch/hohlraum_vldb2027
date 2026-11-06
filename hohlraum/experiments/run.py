@@ -1,4 +1,4 @@
-"""Three experiment entries; supporting clients and preprocessing are internal."""
+"""Internal single-point runner used by the public run.sh experiment suite."""
 import argparse
 import json
 import os

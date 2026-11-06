@@ -1,0 +1,23 @@
+{
+  "skip_tokenizer_init": true,
+  "dtype": "bfloat16",
+  "kv_cache_dtype": "fp8_e4m3",
+  "context_length": 990144,
+  "mem_fraction_static": 0.886,
+  "enable_hierarchical_cache": true,
+  "hicache_ratio": 1,
+  "hicache_size": 299.91370752,
+  "hicache_write_policy": "write_through",
+  "hicache_storage_backend": "file",
+  "hicache_storage_prefetch_policy": "wait_complete",
+  "max_total_tokens": 2213888,
+  "max_running_requests": 128,
+  "page_size": 1024,
+  "chunked_prefill_size": 8192,
+  "random_seed": 0,
+  "disable_overlap_schedule": true,
+  "disable_cuda_graph": true,
+  "tp_size": 2,
+  "device": "cuda",
+  "load_format": "auto"
+}

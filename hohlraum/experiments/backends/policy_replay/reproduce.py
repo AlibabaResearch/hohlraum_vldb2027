@@ -27,7 +27,7 @@ def main():
     a.data=a.data.resolve(); config=read(ROOT/'paper/config.json'); inputs=read(ROOT/'paper/input_manifest.json')
     for name,h in inputs['files'].items():
         f=a.data/name
-        if not f.is_file():p.error(f'Missing paper input {f}. Extract the policy-inputs.tar.gz companion bundle into data/ (see README).')
+        if not f.is_file():p.error(f'Missing paper input {f}. Supply the policy inputs through --data.')
         if sha(f)!=h:p.error(f'Paper input hash mismatch: {f}')
     print('PASS input hashes:',len(inputs['files']),flush=True)
     if not a.no_plots:

@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-python3}"
-MODE="${1:-hisim}"
+MODE="${1:-sglang}"
 DRY=0
 if [[ "${2:-}" == "--dry-run" ]]; then DRY=1; fi
 case "$MODE" in

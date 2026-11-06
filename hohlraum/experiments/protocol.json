@@ -31,13 +31,8 @@
       20,
       32,
       40
-    ],
-    "additional_concurrency": [
-      34,
-      35
     ]
   },
-  "status": "current evaluation protocol; load points not all calibrated to 3/5/10-second targets",
   "scoring_clock": "client_ready_to_completion_excluded",
   "admission_threshold": 0.7,
   "admission_period_seconds": 1800,

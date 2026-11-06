@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
-DATA = Path(os.environ.get('HOHLRAUM_DATA_DIR', str(HERE.parents[3]/'hohlraum-data'))).expanduser().resolve()
+DATA = Path(os.environ.get('HOHLRAUM_DATA_DIR', str(HERE.parents[2]/'data'))).expanduser().resolve()
 
 
 """Validate, reuse or rebuild prepared inputs before either serving backend."""

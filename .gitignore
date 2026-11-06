@@ -16,3 +16,9 @@ private/
 hohlraum/experiments/preprocessing/data/
 
 .venv-reproduce/
+
+/data/
+/results/
+/ssd-cache/
+/.venv-sglang/
+/.venv-hisim/
