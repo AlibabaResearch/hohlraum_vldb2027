@@ -8,19 +8,37 @@ import json
 import os
 from pathlib import Path
 from functools import wraps
-from hohlraum.experiments.common.workload import TraceSource, encode, dump, restore, bootstrap_at_first_ready
+from hohlraum.experiments.common.workload import TraceSource, encode_array, bootstrap_at_first_ready
 from hohlraum.experiments.common.backpressure import QueueDelayAdmission, queue_feedback
 
 
-def install(concurrency, contract):
+def reset_formal_admission(host, start_s):
+    """Reset experiment feedback at measurement start, honoring policy config."""
+    from collections import deque
+    cfg=host.cfg
+    threshold=float(cfg.get('threshold',.7))
+    dynamic=bool(cfg.get('dynamic_admission_threshold',False))
+    policy=host.staging_policy
+    policy.dynamic_admission=dynamic
+    if dynamic:
+        period=float(cfg.get('threshold_period_s',1800.))
+        policy._init_admission_feedback(threshold,cfg.get('duration_s',14400),
+                                        period,cfg.get('threshold_window_s',1800.))
+        policy._admission_history=deque([(float(start_s),0)])
+        policy.next_tick=float(start_s)+period
+    host.admission_threshold=threshold
+    host.sli.set_threshold(threshold)
+    assert host.admission_threshold==threshold and policy.dynamic_admission==dynamic
+    return dict(formal_admission_threshold=threshold,formal_dynamic_admission=dynamic)
+
+
+def install(manifest, contract, rows):
     from sglang_simulator.simulation.sglang.scheduler import ReqDispatcher
     from sglang_simulator.simulation.manager import StateManager
     from sglang.srt.managers.scheduler import Scheduler
     if getattr(ReqDispatcher, '_experiment_closed_loop', False):
         raise RuntimeError('closed-loop source already installed')
-    horizon = float(os.environ.get('HISIM_AGENTX_HORIZON_S', 'inf'))
-    rows_path = os.environ.get('HISIM_AGENTX_COMPACT_ROWS')
-    rows = json.loads(Path(rows_path).read_text()) if rows_path else None
+    horizon = manifest['horizon_s']
     old_add, old_dispatch = ReqDispatcher.add, ReqDispatcher.dispatch
     old_has, old_next, old_reset = ReqDispatcher.has_next, ReqDispatcher.next_req_from_future_ts, ReqDispatcher.reset
     scheduler_ref = [None]
@@ -43,19 +61,13 @@ def install(concurrency, contract):
         old_add(self, reqs)
         if self.offline_recv_all_requests and getattr(self, '_source', None) is None:
             # Native add has received the entire declared input and built its heap.
-            self._source = TraceSource(self.future_queue, concurrency)
-            if os.environ.get('HISIM_RESTORE_CLIENT_CHECKPOINT'):
-                checks=restore(self._source,json.loads(Path(os.environ['HISIM_RESTORE_CLIENT_CHECKPOINT']).read_text()))
-                Path(os.environ['HOHLRAUM_EXPERIMENT_CASE'],'resume_checks.json').write_text(json.dumps(checks))
+            self._source = TraceSource(self.future_queue, manifest['concurrency'])
             self._source._initial_ready, startup = bootstrap_at_first_ready(self._source)
             Path(os.environ['HOHLRAUM_EXPERIMENT_CASE'], 'startup_boundary.json').write_text(json.dumps(startup))
             self.future_queue.clear()
             self._source.request_admission = QueueDelayAdmission(lambda: queue_feedback(scheduler_ref[0], self._source.request_admission, StateManager.get_global_clock()), float(os.environ["HISIM_CLIENT_QUEUE_DELAY_S"]), int(os.environ["HISIM_CLIENT_WAITING_LIMIT"]))
 
     def expand(req):
-        if rows is None:
-            return
-        from array import array
         meta = req.sampling_params.custom_params['simulation']['agentx']
         row = rows[meta['trace_serial']]
         meta['prefix_blocks'] = row['blocks']
@@ -64,8 +76,8 @@ def install(concurrency, contract):
         if policy_meta is not None:
             policy_meta['prefix_blocks'] = row['blocks']
             policy_meta['prefix_page_size'] = 1024
-        req.input_ids = array('q', encode(row['root'], row['blocks'], row['raw_input_tokens'],
-                                        meta['trace_serial'], meta['vocab_size'], contract['token_tail']))
+        req.input_ids = encode_array(row['root'], row['blocks'], row['raw_input_tokens'],
+                                     meta['trace_serial'], meta['vocab_size'], contract['token_tail'])
 
     def dispatch(self):
         source = getattr(self, '_source', None)
@@ -133,9 +145,6 @@ def install(concurrency, contract):
                         device_hit_tokens=req.cached_tokens_device,
                         host_hit_tokens=req.cached_tokens_host,
                         storage_hit_tokens=req.cached_tokens_storage)
-                    if contract['detailed_audit']:
-                        meta = req.sampling_params.custom_params['simulation']['agentx']
-                        source.audit[-1].update(think_time_s=float(meta['think_time']), input_tokens=int(rows[meta['trace_serial']]['raw_input_tokens']))
                     if rows is not None:
                         meta = req.sampling_params.custom_params['simulation']['agentx']
                         source.requests.pop((meta['root'], meta['chain'], meta['index']), None)
@@ -156,29 +165,32 @@ from pathlib import Path
 from functools import wraps
 
 
-def install_horizon(horizon, output):
+def install_horizon(manifest, rows, output):
     from sglang.srt.managers.scheduler import Scheduler
     from sglang_simulator.simulation.manager import StateManager
     from sglang_simulator.simulation.sglang.scheduler import ReqDispatcher, C_SchedulerHook
     from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
     output = Path(output)
+    horizon = manifest['horizon_s']
+    warmup_end = manifest['warmup_seconds']
     from hohlraum.core.staging_storage import BudgetStorage
     old_charge = BudgetStorage._charge
     def charged(self, key):
         old_charge(self, key)
-        if self.budget_exhausted() and not hasattr(self, 'budget_exhausted_at_s'):
+        if self.physical_budget_exhausted() and not hasattr(self, 'budget_exhausted_at_s'):
             self.budget_exhausted_at_s = StateManager.get_global_clock()
             output.mkdir(parents=True, exist_ok=True)
             (output/'budget_exhausted.json').write_text(json.dumps(dict(
-                clock_s=self.budget_exhausted_at_s, write_bytes=self.regular_write_bytes)))
+                clock_s=self.budget_exhausted_at_s, write_bytes=self.validation_write_bytes)))
     BudgetStorage._charge = charged
     old_next = Scheduler.get_next_batch_to_run
     old_result = Scheduler.process_batch_result
     written = False
     next_progress = 0.0
+    measurement_started = False
 
     def observe(scheduler):
-        nonlocal written, next_progress
+        nonlocal written, next_progress, measurement_started
         if written:
             return
         now = StateManager.get_global_clock()
@@ -186,11 +198,50 @@ def install_horizon(horizon, output):
         if source is None:
             return
         tree = scheduler.tree_cache
-        backend = tree.cache_controller.storage_backend
+        host = getattr(tree, 'hohlraum_host', None)
+        backend = host.ssd_backend if host is not None else tree.cache_controller.storage_backend
+        assert isinstance(backend, BudgetStorage), type(backend)
+        if host is not None:
+            assert tree.cache_controller.storage_backend.backing is backend
+        if not measurement_started and now >= warmup_end:
+            from hohlraum.experiments.backends.hisim.warmup import activate
+            activation=activate(tree,source,now,output,rows,manifest['workload'])
+            host = getattr(tree, 'hohlraum_host', None)
+            warm = dict(clock_s=now, warmup_write_bytes=backend.regular_write_bytes,
+                        completed=len(source.completed), cache_preserved=True,
+                        pending_client=len(source.request_admission.pending),
+                        staged_pages=len(host.stage) if host is not None else 0,
+                        host_stats=host.stats() if host is not None else None)
+            formal_cap=manifest['budget_bytes']
+            backend.reset_budget(None if formal_cap is None else formal_cap // tree.tp_world_size)
+            assert not backend.budget_exhausted()
+            if host is not None:
+                assert host.budget_exhausted_at_s is None
+                activation.update(reset_formal_admission(host,warmup_end))
+            (output/'activation-checks.json').write_text(json.dumps(activation))
+            assert tree.cache_controller.storage_backend.validation_cap == backend.validation_cap
+            if host is not None:
+                assert host.write_budget_bytes == backend.validation_cap
+                assert host.budget_charged_bytes == 0
+            warm['formal_budget_bytes_per_rank']=backend.validation_cap
+            (output/'warm_boundary.json').write_text(json.dumps(warm))
+            measurement_started=True
+        storage_exhausted_at = getattr(backend, 'budget_exhausted_at_s', None)
+        cutover_at = host.budget_exhausted_at_s if host is not None else storage_exhausted_at
         progress = dict(clock_s=now, completed=len(source.completed),
-                        write_bytes=getattr(backend, 'regular_write_bytes', 0),
-                        budget_bytes=getattr(backend, 'validation_cap', None), budget_exhausted_at_s=getattr(backend, 'budget_exhausted_at_s', None))
+                        write_bytes=backend.validation_write_bytes,
+                        regular_write_bytes=backend.regular_write_bytes,
+                        transition_write_bytes=backend.transition_write_bytes,
+                        budget_bytes=backend.validation_cap,
+                        budget_exhausted_at_s=cutover_at,
+                        physical_budget_exhausted_at_s=storage_exhausted_at)
         if now >= next_progress:
+            if host is not None:
+                progress['admission_threshold']=host.admission_threshold
+                progress['dynamic_admission']=host.staging_policy.dynamic_admission
+                if not host.cfg.get('dynamic_admission_threshold',False):
+                    assert not host.staging_policy.dynamic_admission
+                    assert abs(host.admission_threshold-float(host.cfg.get('threshold',.7)))<1e-12, 'Fixed threshold changed during experiment'
             output.mkdir(parents=True, exist_ok=True)
             with (output/'progress.jsonl').open('a') as f:
                 f.write(json.dumps(progress)+'\n')
@@ -208,15 +259,13 @@ def install_horizon(horizon, output):
                         progress=progress, iterations=C_SchedulerHook.ITERATION_STATS,
                         performance_validated=False, timing='unchanged native HiSim')
         if gate is not None:
-            snapshot["client_admission"] = dict(limit=gate.limit, pending=len(gate.pending), inflight=len(gate.inflight), records=gate.records, ttft_includes_external_wait=True)
+            snapshot["client_admission"] = dict(waiting_limit=gate.waiting_limit, pending=len(gate.pending), inflight=len(gate.inflight), records=gate.records, ttft_includes_external_wait=True)
         host = getattr(tree, 'hohlraum_host', None)
         if host is not None:
             snapshot['hohlraum'] = host.stats()
         probe = getattr(tree, 'prefetch_outcome_stats_snapshot', None)
         if probe is not None:
             snapshot['prefetch_outcomes'] = probe()
-        if os.environ.get('HISIM_SAVE_CLIENT_CHECKPOINT') == '1':
-            (output/'client_checkpoint.json').write_text(json.dumps(dump(source,now)))
         tmp = output/'horizon.pending.json'
         tmp.write_text(json.dumps(snapshot))
         tmp.replace(output/'horizon.json')

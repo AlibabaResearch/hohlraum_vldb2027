@@ -1,16 +1,38 @@
-"""Plot and summarize independently capacity-calibrated policy runs."""
+"""Render paper figures from completed policy replay results."""
+import argparse
 import json
 from pathlib import Path
+
 import numpy as np
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
-import sys
-R=Path(sys.argv[1]).resolve()/'policy';OUT=Path(sys.argv[1]).resolve()/'figures';OUT.mkdir(parents=True,exist_ok=True)
-SEEDS=(20261012,20261013,20261014);WORK=('agentx','playing');TH=(0,.1,.3,.5,.7,.9,1.);RATIOS=(0,.1,.25,.4,.5,.6,.8)
-assert (R/'completed.json').exists()
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('output', type=Path, help='Directory produced by the policy replay')
+output = parser.parse_args().output.resolve()
+R = output / 'policy'
+OUT = output / 'figures'
+if not (R / 'completed.json').is_file():
+    parser.error(f'Missing completed replay results in {R}')
+OUT.mkdir(parents=True, exist_ok=True)
+
+config = json.loads((output / 'manifest.json').read_text())['config']
+SEEDS = tuple(sorted({case['seed'] for case in config['cases']}))
+WORK = ('agentx', 'playing')
+TH = tuple(config['thresholds'])
+RATIOS = tuple(config['staging_fractions'])
+LARC_RATIOS = tuple(config['larc_ratios'])
+ACCESS_COUNTS = tuple(config['access_counts'])
+
+def save_figure(figure, stem, dpi):
+    for suffix in ('pdf', 'png'):
+        figure.savefig(OUT / f'{stem}.{suffix}', dpi=dpi, bbox_inches='tight', pad_inches=.05)
+    plt.close(figure)
+
 def get(s,w,l,m='full_nocopy',t=.7,r=.5,v='full',family='policy'):
  d=R/f'seed{s}'/w/f'coverage{l}';ps=list(d.glob(f'{family}-{m.replace(":","-")}-t{t:.2f}-r{r:g}-{v}-c*.json'));assert len(ps)==1,(s,w,l,m,t,r,v,ps);return json.loads(ps[0].read_text())
 def allrow(s,w,l):return get(s,w,l,'all',0,0,family='baseline')
@@ -18,7 +40,7 @@ def xy(row,ref):return row['written_blocks']/ref['written_blocks'],100*row['glob
 def meanxy(w,l,m='full_nocopy',t=.7,r=.5,v='full',family='policy'):return np.mean([xy(get(s,w,l,m,t,r,v,family),allrow(s,w,l)) for s in SEEDS],axis=0)
 def larc(s,w,l):
  c=json.loads((R/f'seed{s}'/w/'capacities.json').read_text())[str(l)]['capacity_blocks']
- return get(s,w,l,f'larc:{round(c*256)}',0,0,family='baseline')
+ return get(s,w,l,f'larc:{round(c*max(LARC_RATIOS))}',0,0,family='baseline')
 def envelope(pts):
  out=[];hi=-1
  for x,y in sorted(pts, key=lambda p:(float(p[0]),float(p[1]))):
@@ -35,7 +57,7 @@ for w in WORK:
   if kind in ('full_nocopy','lru_nocopy'):
    pts=[meanxy(w,80,kind,t,.5 if kind=='full_nocopy' else 0) for t in TH]
   else:
-   for n in ((1,2,3,4,5,8,12,20) if kind=='access' else (.1,.2,.4,.8,1.6,3.2,6.4,16,64,256)):
+   for n in (ACCESS_COUNTS if kind=='access' else LARC_RATIOS):
     vals=[]
     for s in SEEDS:
      c=json.loads((R/f'seed{s}'/w/'capacities.json').read_text())['80']['capacity_blocks'];mode=f'{kind}:{n if kind=="access" else max(1,round(c*n))}'
@@ -49,8 +71,7 @@ for w in WORK:
  visible_y.append(float(star[1]));lo=min(visible_y);hi=max(visible_y);pad=max(.15,.04*(hi-lo));ax.set_ylim(lo-pad,min(100,hi+pad));ax.set_xticks([.2,.4,.6,.8,1.]);ax.yaxis.set_major_locator(MaxNLocator(4))
  ax.legend(loc='best',framealpha=.9,labelspacing=.15,handlelength=1.,fontsize=4.6)
  fig.subplots_adjust(left=.23,right=.98,bottom=.25,top=.85)
- for ext in ('pdf','png'):fig.savefig(OUT/f'policy-{w}-coverage-capacity-20261031.{ext}',dpi=220)
- plt.close(fig)
+ save_figure(fig, f'{w}-hit-write', dpi=220)
  savings=[]
  for s in SEEDS:
   rows={m:[get(s,w,80,m,t,.5 if m=='full_nocopy' else 0) for t in TH] for m in ('full_nocopy','lru_nocopy')}
@@ -77,8 +98,7 @@ for panel,(ax,variants) in enumerate(zip(axs,(left,right))):
  ax.legend(loc='upper left',bbox_to_anchor=(-.13,-.30),frameon=False,fontsize=5.8,handletextpad=.2)
  if panel:ax.axhline(0,c='#999',lw=.5,ls='--');ax.axvline(0,c='#999',lw=.5,ls='--')
 fig.subplots_adjust(left=.13,right=.985,top=.9,bottom=.4,wspace=.55)
-for ext in ('pdf','png'):fig.savefig(OUT/f'policy-ablation-coverage-capacity-20261031.{ext}',dpi=240)
-plt.close(fig)
+save_figure(fig, 'playing-policy-ablation', dpi=240)
 # Same hit-write sensitivity form, with percentage allocations.
 fig,ax=plt.subplots(figsize=(3.35,2.65));style(ax)
 colors={'agentx':'#1769a0','playing':'#d65b35'};styles={80:'-',90:'--',99:':'};shapes={80:'o',90:'s',99:'^'}
@@ -103,8 +123,7 @@ leg=ax.legend(handles=handles,ncol=4,loc='upper center',bbox_to_anchor=(.5,-.20)
 handles=[Line2D([],[],ls='',marker='o',ms=np.sqrt(9+24*r),mfc='white' if r==0 else '#888',mec='#888',label=f'{r*100:g}%') for r in (0,.25,.5,.8)]
 ax.legend(handles=handles,title='Staging / total DRAM',title_fontsize=6,ncol=4,loc='upper center',bbox_to_anchor=(.5,-.40),frameon=False,fontsize=6,columnspacing=.7,handletextpad=.3)
 fig.subplots_adjust(left=.17,right=.98,top=.96,bottom=.36)
-for ext in ('pdf','png'):fig.savefig(OUT/f'policy-sensitivity-coverage-capacity-20261031.{ext}',dpi=240)
-plt.close(fig)
+save_figure(fig, 'capacity-sensitivity', dpi=240)
 def compare(a,b):
  vals=[]
  for s in SEEDS:

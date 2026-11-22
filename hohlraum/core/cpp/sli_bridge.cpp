@@ -7,7 +7,7 @@ static thread_local std::string error;
 extern "C" {
 const char* hh_error(){return error.c_str();}
 void* hh_create_joint(double threshold){
- try {return new History(1,1,threshold,30.);}
+ try {return new History(1,1,threshold,60.);}
  catch(const std::exception& e){error=e.what();return nullptr;}
 }
 unsigned hh_sli_version(){return 1;}
@@ -20,8 +20,24 @@ int hh_advance(void* p,double t){try{static_cast<History*>(p)->advance(t);return
 int hh_threshold(void* p,double v){try{static_cast<History*>(p)->set_threshold(v);return 0;}catch(const std::exception& e){error=e.what();return -1;}}
 int hh_query(void* p,double t,const unsigned* ids,unsigned n,double* out){try{auto& h=*static_cast<History*>(p);using Sig=std::vector<std::tuple<SessionId,double,double,uint64_t,int64_t>>;
 std::map<Sig,History::JointScore> memo;
+History::WaitMemo waits;
 for(unsigned i=0;i<n;++i){Sig sig;const auto owners=h.owners(ids[i]);sig.reserve(owners.size());
 for(const auto& a:owners)sig.emplace_back(a.session,a.last_access,a.old_since,a.request_sequence,a.old_gap);
-auto it=memo.find(sig);if(it==memo.end())it=memo.emplace(std::move(sig),h.joint_score(ids[i],t)).first;
+auto it=memo.find(sig);if(it==memo.end())it=memo.emplace(std::move(sig),h.joint_score(ids[i],t,&waits)).first;
 const auto& s=it->second;out[5*i]=s.admission;out[5*i+1]=s.wait;out[5*i+2]=s.weight;out[5*i+3]=s.pending;out[5*i+4]=s.mature;}return 0;}catch(const std::exception& e){error=e.what();return -1;}}
+}
+
+extern "C" unsigned long long hh_statistics_updates(void* p){return static_cast<History*>(p)->statistics_updates;}
+extern "C" double hh_statistics_last_update(void* p){return static_cast<History*>(p)->last_statistics_update;}
+extern "C" double hh_statistics_period(void* p){return static_cast<History*>(p)->statistics_period();}
+
+// Read only the current-context risk: no TTD recomputation or history mutation.
+extern "C" int hh_context_risks(void* p,const unsigned* ids,unsigned n,double* out){
+ try{auto& h=*static_cast<History*>(p);
+  for(unsigned i=0;i<n;++i){double risk=0.;
+   for(const auto& a:h.owners(ids[i])){const auto& s=h.sessions[a.session];
+    if(a.request_sequence==s.request_sequence)risk=std::max(risk,h.online_length_risk(s.fold,s.length));}
+   out[i]=risk;}
+  return 0;
+ }catch(const std::exception& e){error=e.what();return -1;}
 }

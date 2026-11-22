@@ -1,12 +1,10 @@
-"""Fetch only the data resources required by the selected experiment backend."""
+"""Install bundled processed inputs required by the selected experiment backend."""
 import hashlib
 import json
+import os
 from pathlib import Path
-import shutil
 import tarfile
 import tempfile
-import urllib.request
-import urllib.error
 
 MANIFEST = Path(__file__).with_name('resources.json')
 
@@ -22,7 +20,7 @@ def digest(path):
 def install_archive(archive, destination, expected_sha256):
     """Verify before extraction; never replace a user's different local data."""
     if digest(archive) != expected_sha256:
-        raise ValueError('Downloaded resource checksum mismatch: '+str(archive))
+        raise ValueError('Resource checksum mismatch: '+str(archive))
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.resource-', dir=destination.parent) as tmp:
         unpacked = Path(tmp)
@@ -48,29 +46,51 @@ def install_archive(archive, destination, expected_sha256):
             source.replace(target)
 
 
-def ensure_resources(data, backend, *, check_only=False, manifest=MANIFEST):
+def ensure_resources(data, backend, *, manifest=MANIFEST):
     resources = json.loads(Path(manifest).read_text())
-    required = ['policy'] if backend == 'policy' else ['serving']
-    if backend == 'hisim':
-        required.append('hisim')
-    for name in required:
-        resource = resources[name]
-        if all((data/p).exists() for p in resource['required_paths']):
-            continue
-        url = resource.get('url')
-        if check_only:
-            raise ValueError('Missing '+name+' data under '+str(data)+'. Validation does not download resources.')
-        if not url:
-            raise ValueError('The '+name+' resource has no published download URL yet. Supply its local data directory with --data.')
-        print('Downloading '+name+' resources...', flush=True)
-        with tempfile.TemporaryDirectory(prefix='hohlraum-download-') as tmp:
-            archive = Path(tmp)/resource['filename']
-            try:
-                with urllib.request.urlopen(url, timeout=60) as response, archive.open('wb') as out:
-                    shutil.copyfileobj(response, out)
-            except urllib.error.URLError as error:
-                raise ValueError('Cannot download '+name+' resources from '+url+
-                                 '. Check that the data release is published, or supply an existing --data directory. '+str(error)) from error
-            install_archive(archive, data, resource['sha256'])
-        if not all((data/p).exists() for p in resource['required_paths']):
-            raise ValueError('Resource archive lacks required '+name+' files')
+    resource = resources['serving']
+    simulator_files = resources['hisim']['files'] if backend == 'hisim' else {}
+    required = (['runtime/priors/agentx', *simulator_files] if simulator_files
+                else resource['required_paths'])
+    if not all((data/path).exists() for path in required):
+        archive = (Path(manifest).resolve().parent / resource['archive']).resolve()
+        if not archive.is_file():
+            raise ValueError('Missing bundled resource: '+str(archive))
+        print('Extracting bundled experiment inputs...', flush=True)
+        install_archive(archive, data, resource['sha256'])
+    for path in required:
+        if not (data/path).exists():
+            raise ValueError('Missing required experiment input: '+str(data/path))
+    for path, expected in simulator_files.items():
+        if digest(data/path) != expected:
+            raise ValueError('HiSim asset checksum mismatch: '+str(data/path))
+
+
+def lifecycle_model_count(directory):
+    """Use the exported schema; surplus numbered models are an input error."""
+    directory = Path(directory)
+    metadata = json.loads((directory/'training.json').read_text())
+    count = metadata.get('model_count') if isinstance(metadata, dict) else None
+    if type(count) is not int or count not in (2, 6):
+        raise ValueError('Current lifecycle priors require model_count 2 or 6 in training.json: '+str(directory))
+    found = {p.name for p in directory.glob('[0-9].txt')}
+    expected = {f'{i}.txt' for i in range(count)}
+    if found != expected:
+        raise ValueError('Lifecycle prior files disagree with training.json: '
+                         f'{directory}; missing={sorted(expected-found)}, '
+                         f'outdated={sorted(found-expected)}')
+    if count == 2 and (directory/'model-schema.txt').read_text().strip() != 'session-qg-only-v1':
+        raise ValueError('AgentX prior schema is not session-qg-only-v1')
+    return count
+
+
+def lifecycle_environment(priors):
+    priors = Path(priors).resolve()
+    return dict(
+        HOHLRAUM_JOINT_MODELS=str(priors),
+        HOHLRAUM_MODEL_COUNT=str(lifecycle_model_count(priors)),
+        HOHLRAUM_BRANCH_PRIOR=str(priors/'branch-prior.txt'),
+        HOHLRAUM_LENGTH_CURVES=str(priors/'length_curves.txt'),
+        HOHLRAUM_ONLINE_UPDATES='1',
+        HOHLRAUM_STATISTICS_PERIOD_S=os.environ.get('HOHLRAUM_STATISTICS_PERIOD_S','3600'),
+    )

@@ -54,9 +54,13 @@ public:
         }
     }
 
-    std::set<BlockId> endpoints(SessionId session) const {
+    struct Roles {
+        std::set<BlockId> heads, tails;
+    };
+
+    Roles endpoints(SessionId session) const {
         const auto& tree = trees.at(session);
-        std::set<BlockId> result;
+        Roles result;
         struct Visit { BlockId block, last_active; };
         std::vector<Visit> pending{{kNoBlock, kNoBlock}};
         while (!pending.empty()) {
@@ -65,13 +69,13 @@ public:
             const auto& node = tree.nodes.at(block);
             if (!node.active_subtree) continue;
             if (node.active) {
-                if (last == kNoBlock) result.insert(block);
+                if (last == kNoBlock) result.heads.insert(block);
                 last = block;
             }
-            if (node.children.empty() && last != kNoBlock) result.insert(last);
+            if (node.children.empty() && last != kNoBlock) result.tails.insert(last);
             for (auto child : node.children) {
                 if (tree.nodes.at(child).active_subtree) pending.push_back({child, last});
-                else if (last != kNoBlock) result.insert(last);
+                else if (last != kNoBlock) result.tails.insert(last);
             }
         }
         return result;

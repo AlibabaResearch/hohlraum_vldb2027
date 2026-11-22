@@ -6,7 +6,7 @@
   "mem_fraction_static": 0.886,
   "enable_hierarchical_cache": true,
   "hicache_ratio": 1,
-  "hicache_size": 299.91370752,
+  "hicache_size": 149.95685376,
   "hicache_write_policy": "write_through",
   "hicache_storage_backend": "file",
   "hicache_storage_prefetch_policy": "wait_complete",

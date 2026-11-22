@@ -1,5 +1,32 @@
 """Experiment server entry; uses the unmodified SGLang launcher and scheduler."""
+from functools import wraps
 import os
+
+
+def install_native_attachment(cache_type, attach):
+    """Attach on a stock HiCache build after its backend is initialized."""
+    if getattr(cache_type, '_hohlraum_native_attachment', False):
+        return
+    original = cache_type.init_hicache
+
+    @wraps(original)
+    def init_hicache(cache, *args, **kwargs):
+        result = original(cache, *args, **kwargs)
+        filename = os.environ.get('HOHLRAUM_CONFIG')
+        # The bundled runtime already attaches. A None host means a
+        # successful budget-only attachment.
+        if filename and not hasattr(cache, 'hohlraum_host'):
+            attach(cache, filename)
+        return result
+
+    cache_type.init_hicache = init_hicache
+    cache_type._hohlraum_native_attachment = True
+
+
+if os.environ.get('HOHLRAUM_CONFIG'):
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from hohlraum.core.staging_storage import attach
+    install_native_attachment(UnifiedRadixCache, attach)
 
 # Executed in spawned workers as well as the parent launcher.
 if os.environ.get('HOHLRAUM_NATIVE_FEEDBACK'):

@@ -5,20 +5,24 @@ StagingPolicy owns decisions; native runtimes retain scheduling and I/O timing.
 from __future__ import annotations
 from contextlib import nullcontext, contextmanager
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from types import SimpleNamespace
+from dataclasses import dataclass
 import json
 import heapq
 from pathlib import Path
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from hohlraum.core.sli import SLI
+from hohlraum.core.read_pressure import install_prefill_observer, observe_physical_wait
 from hohlraum.core.staging_policy import StagingPolicy
-from collections import Counter
-from dataclasses import dataclass
 import os
 import threading
 import time
 from functools import wraps, partial
+
+
+def native_completion_timestamp(req, fallback):
+    """Read the scheduler's completion timestamp, captured before output."""
+    completed = getattr(getattr(req, 'time_stats', None), 'completion_time', 0.)
+    return completed if completed > 0 else fallback
 
 
 class HostPayloadIndex:
@@ -27,16 +31,22 @@ class HostPayloadIndex:
         self.nodes = {}
         self.tokens = {}
         self.host_keys = Counter()
+        self.native_live_keys = Counter()
+        self._native_live_keys = {}
         self.key_nodes = {}
         self._keys = {}
         self.total_tokens = 0
         self.on_payload_change = None
         self.on_key_membership_change = None
+        self._batch_depth = 0
+        self._batch_nodes = {}
         for node in tuple(core._node_arena.values()):
             self.sync(node)
 
     def forget(self, node):
         nid = node.id
+        self._batch_nodes.pop(nid, None)
+        self._sync_native_live(node, removed=True)
         old = self.tokens.pop(nid, 0)
         self.total_tokens -= old
         self.nodes.pop(nid, None)
@@ -52,9 +62,33 @@ class HostPayloadIndex:
         if self.on_payload_change is not None:
             self.on_payload_change(nid)
 
+    def _sync_native_live(self, node, removed=False):
+        # Mirror the old arrival predicate, including HBM-only native nodes.
+        keys = (() if removed or node is self.core.root_node or getattr(node, 'evicted', True)
+                else tuple(node.hash_value or ()))
+        previous = self._native_live_keys.get(node.id, ())
+        if previous == keys:
+            return
+        changes = Counter(keys)
+        changes.subtract(previous)
+        for key, delta in changes.items():
+            value = self.native_live_keys.get(key, 0) + delta
+            if value:
+                self.native_live_keys[key] = value
+            else:
+                self.native_live_keys.pop(key, None)
+        if keys:
+            self._native_live_keys[node.id] = keys
+        else:
+            self._native_live_keys.pop(node.id, None)
+
     def sync(self, node):
         if node is None:
             return
+        if self._batch_depth:
+            self._batch_nodes[node.id] = node
+            return
+        self._sync_native_live(node)
         nid = node.id
         cd = node.component_data[self.ct]
         value = cd.host_value
@@ -99,6 +133,64 @@ class HostPayloadIndex:
         if self.on_payload_change is not None:
             self.on_payload_change(nid)
 
+    def begin_batch(self):
+        self._batch_depth += 1
+
+    def end_batch(self):
+        assert self._batch_depth > 0
+        self._batch_depth -= 1
+        if not self._batch_depth:
+            pending, self._batch_nodes = self._batch_nodes, {}
+            self._sync_batch(pending)
+
+    def _sync_batch(self, pending):
+        # A split usually only changes which node owns the same prefix pages.
+        # Coalesce aggregate membership before emitting any adapter callbacks.
+        # This avoids removing/re-adding every prefix in the global counters.
+        prepared = []
+        old_host, new_host, old_live, new_live = [], [], [], []
+        for nid, node in pending.items():
+            value = node.component_data[self.ct].host_value
+            tokens = 0 if value is None else value.numel()
+            keys = tuple(node.hash_value or ()) if tokens else ()
+            live = (() if node is self.core.root_node or getattr(node, 'evicted', True)
+                    else tuple(node.hash_value or ()))
+            previous = self._keys.get(nid, ())
+            old_host.extend(previous);new_host.extend(keys)
+            old_live.extend(self._native_live_keys.get(nid, ()));new_live.extend(live)
+            prepared.append((nid,node,tokens,previous,keys,live))
+        for nid, node, tokens, previous, keys, live in prepared:
+            self.total_tokens += tokens-self.tokens.get(nid,0)
+            if tokens:self.nodes[nid]=node;self.tokens[nid]=tokens
+            else:self.nodes.pop(nid,None);self.tokens.pop(nid,None)
+            if previous != keys:
+                before, after = set(previous), set(keys)
+                for key in before-after:
+                    self.key_nodes[key].discard(nid)
+                    if not self.key_nodes[key]:del self.key_nodes[key]
+                for key in after-before:self.key_nodes.setdefault(key,set()).add(nid)
+            if keys:self._keys[nid]=keys
+            else:self._keys.pop(nid,None)
+            if live:self._native_live_keys[nid]=live
+            else:self._native_live_keys.pop(nid,None)
+        changed=[]
+        for counter, before, after, notify in [
+                (self.host_keys,old_host,new_host,True),
+                (self.native_live_keys,old_live,new_live,False)]:
+            if before==after:continue
+            delta=Counter(after);delta.subtract(before)
+            for key, difference in delta.items():
+                if not difference:continue
+                previous=counter.get(key,0);current=previous+difference
+                assert current>=0
+                if current:counter[key]=current
+                else:counter.pop(key,None)
+                if notify and bool(previous)!=bool(current):changed.append(key)
+        if self.on_key_membership_change is not None:
+            for key in changed:self.on_key_membership_change(key)
+        if self.on_payload_change is not None:
+            for nid, *_ in prepared:self.on_payload_change(nid)
+
     def validate(self):
         nodes = list(self.core._node_arena.values())
         tokens = {n.id: n.component_data[self.ct].host_value.numel() for n in nodes
@@ -139,25 +231,49 @@ class HostPayloadIndex:
                         self.sync(other)
             return result
         component.commit_hicache_transfer = commit
+        # Storage may be enabled after an initial HBM-only phase. Backfill is
+        # the native bulk hash mutation that does not emit leaf-set updates.
+        backfill = getattr(core, 'backfill_missing_hash_values', None)
+        if backfill is not None:
+            def backfill_and_sync(*args, **kwargs):
+                result = backfill(*args, **kwargs)
+                for node in tuple(core._node_arena.values()):
+                    self.sync(node)
+                return result
+            core.backfill_missing_hash_values = backfill_and_sync
 
 
 def return_waiting_to_read(h):
     core=h.cache.tree_core;page=h.cache.page_size
     entries=list(h.stage.values())
-    if not entries:return
+    if not entries:
+        h._budget_return_pending=False
+        h._budget_return_started=True
+        return
     before=dict(waiting_pages=len(entries),read_tokens=h.read_allocated(),read_limit=h.read_limit,
                 physical_free=h._physical_available(),budget=h.budget_charged_bytes,time=h.now())
     recency={k:n.last_access_time for n in core._node_arena.values() for k in n.hash_value or ()}
-    recency.update({e.hash_value[0]:e.last_access_time for e in entries})
+    # A staged page can still have an HBM node with a more recent access.
+    # Returning its host allocation must preserve that native LRU priority.
+    for entry in entries:
+        key=entry.hash_value[0]
+        staged_access=entry.last_access_time
+        recency[key]=max(staged_access,recency.get(key,staged_access))
     ordered=sorted(entries,key=lambda e:len(e.prefix_hashes))
     # Returning a role is not an access and must not trigger another eviction
     # while this ownership transaction is in progress.
     was_driving=h._in_drive;h._in_drive=True
-    restored=[];blocked=[]
+    restored=[];blocked=[];deferred=set()
     try:
         for e in ordered:
             if e.owner!='staging':continue
             parent=e.prefix_hashes[-1] if e.prefix_hashes else None
+            # Restore the quota immediately, but never transfer/free a source
+            # still owned by a read or write. Retry these pages after its ACK.
+            if (e.read_pins or e.operation is not None
+                    or getattr(e,'copy_committed',False) or parent in deferred):
+                deferred.add(e.hash_value[0])
+                continue
             anchor=core.root_node if parent is None else next(
                 (n for n in core._node_arena.values() if parent in (n.hash_value or ())),None)
             if anchor is not None and parent is not None:
@@ -172,22 +288,25 @@ def return_waiting_to_read(h):
         for n in core._node_arena.values():
             times=[recency[k] for k in n.hash_value or () if k in recency]
             if times:n.last_access_time=max(times)
-        # Explicit user-requested transition exception: these payloads are
-        # already allocated. Keep them until real native SSD completion, retaining
-        # their existing staging allocation until ACK; ordinary future evictions are not exempt.
+        # Account for blocked ownership returns as cutover writes. Keep each
+        # existing allocation until the native write acknowledgement.
         h._staging_return_flush.update(x['key'] for x in blocked)
         for e in ordered:
             if e.hash_value[0] in h._staging_return_flush and e.operation is None and not h._has_ssd_copy(e):
-                h._submit_stage_write(e,budget_exempt=True)
+                h._submit_stage_write(e,transition=True)
         after=dict(restored_pages=len(restored),blocked=blocked,read_tokens=h.read_allocated(),
-                   physical_free=h._physical_available(),waiting_pages=h.waiting_staging_tokens()//page)
+                   physical_free=h._physical_available(),waiting_pages=h.waiting_staging_tokens()//page,
+                   deferred_pages=len(deferred))
+        h._budget_return_pending=bool(deferred)
         record=dict(before=before,after=after)
         h.staging_return_records=getattr(h,'staging_return_records',[])+[record]
         if h.stats_path:
             with Path(h.stats_path).with_suffix('.staging-return.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
         assert after['physical_free']==before['physical_free'], ('ownership_return_allocated_or_freed',record)
-        assert all(e.hash_value[0] in h._staging_return_flush for e in h.stage.values()),record
+        assert all(e.hash_value[0] in h._staging_return_flush or e.hash_value[0] in deferred
+                   for e in h.stage.values()),record
         assert h.read_allocated()<=h.read_limit,record
+        h._budget_return_started=True
     finally:
         h._in_drive=was_driving
 
@@ -205,11 +324,6 @@ class StagedPage:
     native_lock: object = None
     read_pins: int = 0
     read_pin_lock: object = None
-    @property
-    def evicted(self): return True
-    @property
-    def component_data(self):
-        return [SimpleNamespace(host_value=self.payload, value=None, host_lock_ref=self.read_pins, lock_ref=0)]
 
 
 class NativeHost:
@@ -219,30 +333,21 @@ class NativeHost:
                 if req.__class__.__name__ in ("TokenizedGenerateReqInput", "BatchTokenizedGenerateReqInput"):
                     self.observe_request(req, now)
 
-    def before_schedule(self, now):
-        if self.sli is not None:
-            self.staging_policy.maybe_control(now)
-
-    def next_policy_deadline(self):
-        deadlines=[]
-        ref=self.staging_policy
-        if ref.dynamic_admission and ref.next_tick<=ref.cfg['duration_s']:
-            deadlines.append(ref.next_tick)
-        if self.capacity_controller:
-            deadlines.append(self.capacity_controller.next_tick)
-        return min(deadlines) if deadlines else None
-
-    def on_batch_complete(self, requests, now):
+    def on_batch_complete(self, requests, now, *, defer_completion=False):
         if self.sli is not None:
             for req in requests:
                 if len(req.output_ids) != 0:
                     self.sli.release_read(req.rid)
-                if req.finished():
-                    self.sli.complete(req, now)
+                if req.finished() and not defer_completion:
+                    completed = now
+                    if getattr(self, '_native_wall_clock', False):
+                        completed = native_completion_timestamp(req, self.started_at + now) - self.started_at
+                    self.sli.complete(req, completed)
 
     def __init__(self, cache, cfg, total_tokens, staging_tokens, *, clock=None, storage_factory=None):
         self.lock = threading.RLock()
         self.started_at = time.monotonic()
+        self._native_wall_clock = clock is None
         storage_factory = storage_factory or StagingStorage.create
         read_limit, staging_limit = total_tokens-staging_tokens, staging_tokens
         stats_path = cfg.get('stats_path')
@@ -256,43 +361,47 @@ class NativeHost:
         self.configured_staging_limit=staging_limit
         if fraction:raise ValueError('fixed write buffer removed; use native async writes')
         self._staging_return_flush=set()
-        self.staging_return_exempt_bytes=0
+        self._budget_return_pending=False
+        self._budget_return_started=False
+        self._write_cutover_pages=0
         self.admission_policy=cfg.get('admission_policy','write_all')
-        self.materialization_timing=cfg.get('materialization_timing','on_evict')
-        if self.materialization_timing!='on_evict':raise ValueError('Hohlraum supports staging-exit admission only')
+        if cfg.get('materialization_timing','on_evict')!='on_evict':raise ValueError('Hohlraum supports staging-exit admission only')
         self.residency_policy=cfg.get('residency_policy','lru')
         if self.admission_policy not in ('agent','write_all','write_none'):raise ValueError('invalid admission')
         if self.residency_policy not in ('lru','joint_hts'):raise ValueError('overlay supports native LRU or paper HTS')
-        if not cfg.get('reference_history'):raise ValueError('overlay requires the canonical reference history')
+        if not cfg.get('reference_history', True):raise ValueError('overlay requires the canonical reference history')
         self.admission_threshold=float(cfg.get('threshold',.7))
         self.kv_bytes_per_token=int(cfg['kv_bytes_per_token'])
         self.stats_path=Path(stats_path) if stats_path else None
         self.component=cache.components[ComponentType.FULL]
-        self.stage={};self.absorbed=set();self._next_stage_id=-1;self.inflight={}
+        self.stage={};self._next_stage_id=-1;self.inflight={}
+        self._waiting_stage_keys = set()
+        self._prefix_read_release = {}
         self.admission_observed_rids=set();self.request_hashes={}
         self.budget_exhausted_at_s=None
         self._next_budget_snapshot_s=0.
         self._next_stats_snapshot_s=0.
-        self.staging_pressure=dict(pre_retire=0,wait_existing_write=0,no_read_candidate=0,no_stage_candidate=0,no_retire_progress=0,transfer_attempts=0,transfer_succeeded=0,transfer_failed=0)
+        self.staging_pressure=dict(discard_on_entry=0,pre_retire=0,wait_existing_write=0,no_read_candidate=0,no_stage_candidate=0,no_retire_progress=0,transfer_attempts=0,transfer_succeeded=0,transfer_failed=0)
         self.last_transfer_pressure=None
-        self.pressure_waiting=False;self._in_match=False;self._in_drive=False
+        self._in_drive=False
         self.sli=SLI(self,cfg)
         self.lifecycle=self.sli if self.admission_policy=='agent' else None
-        self.residency=self.sli if self.admission_policy=='agent' else None
         self.staging_policy=StagingPolicy(self)
         self.capacity_controller=None
+        self.budget_consensus=None
         self._host_index=HostPayloadIndex(cache.tree_core,ComponentType.FULL);self._host_index.bind()
         self._bind_resident_index()
         fields=('ssd_written_tokens','ssd_write_failures','ssd_prefetched_tokens','staging_exits',
                 'read_releases','duplicate_reclaimed_tokens','demotions','promotions','peak_read_tokens',
                 'peak_staging_tokens','over_limit_events','admission_write_decisions','admission_drop_decisions',
-                'discarded_tokens','staging_reclassified_tokens','persisted_reclaimed_tokens',
-                'budget_rejected_tokens','storage_unconfirmed_tokens',
-                'host_pressure_retries','host_pressure_reclaimed_tokens','host_pressure_write_wait_s',
+                'discarded_tokens',
                 'overlay_transfers_in','overlay_transfers_read','overlay_write_returns_read',
                 'overlay_write_releases','overlay_backup_reuses')
         for name in fields:setattr(self,name,0)
         self._original_drive_host_eviction=self.component.drive_host_eviction
+        import inspect
+        self._native_cache_action_api = 'cache_actions' in inspect.signature(cache.tree_core._evict_host_leaf).parameters
+        self._native_leaf_callback_api = 'leaf_handler' in inspect.signature(self._original_drive_host_eviction).parameters
         self.component.drive_host_eviction=self._drive_host_eviction
         self.allocation_progress = {}
         self._read_ownership = Counter()
@@ -313,6 +422,10 @@ class NativeHost:
                 self.capacity_consensus=native_capacity_consensus(self.capacity_controller)
             self._attach_capacity_feedback()
             self._attach_writeback_feedback()
+        elif (not os.environ.get('SGLANG_SIMULATOR_CONFIG_PATH')
+              and cache.tp_world_size>1 and cfg.get('write_budget_bytes') is not None):
+            from hohlraum.core.capacity_controller import native_budget_consensus
+            self.budget_consensus=native_budget_consensus(self)
         query = cache.cache_controller._storage_hit_query
         @wraps(query)
         def pinned_query(*args, **kwargs):
@@ -324,10 +437,11 @@ class NativeHost:
         return key in self.stage
 
     def accept_evicted(self, entry):
+        assert len(entry.hash_value) == 1 and entry.payload.numel() == self.cache.page_size
         key = entry.hash_value[0]
         assert key not in self.stage and entry.owner == 'staging'
         self.stage[key] = entry
-        self.absorbed.add(entry.id)
+        self._staging_changed(key)
         self.demotions += 1
         self.overlay_transfers_in += 1
         self._resident_key_changed(key)
@@ -344,7 +458,16 @@ class NativeHost:
         entry.read_pins -= 1
         assert entry.read_pins >= 0
         self._read_ownership['source_unpins'] += 1
+        if not entry.read_pins and entry.read_pin_lock is not None:
+            self.cache.dec_host_lock_ref(*entry.read_pin_lock)
+            entry.read_pin_lock = None
         self._release_transferred_source(entry)
+        if (not entry.read_pins and entry.operation is None
+                and getattr(entry, 'fallback_write_committed', False)
+                and self.stage.get(entry.hash_value[0]) is entry):
+            self._remove_stage(entry, free=True)
+            self.overlay_write_releases += 1
+            self.staging_exits += 1
 
     def confirm_read(self, keys):
         for key in keys:
@@ -401,9 +524,12 @@ class NativeHost:
         self.cache.evict_host = evict
 
     def _attach_hbm_eviction(self):
-        # Reclaiming a WT host duplicate allows an unbacked device parent
-        # to retain host-only children. Preserve that structural parent when
-        # evicting HBM, instead of using native WT's whole-node deletion.
+        # Write-through backing belongs to the logical (staging + SSD) tier,
+        # rather than requiring its copy to remain in read DRAM. Releasing a
+        # read copy can therefore leave an HBM parent with host-only children.
+        # Preserve that structural parent when evicting HBM, instead of native
+        # WT's whole-node deletion. This adapts backing ownership to the tier
+        # abstraction; it is not a workaround for staging prefetch failures.
         # This must remain installed after budget exhaustion: old mixed-tier
         # branches can outlive the switch back to native host candidates.
         if not self.cfg.get('stage_hbm_leaves', False):
@@ -437,12 +563,13 @@ class NativeHost:
             core._begin_tracking_unbacked_tokens()
             try:
                 trigger = core.components_by_type[ComponentType.FULL]
-                core._evict_component_and_detach_lru(
+                self._native_mutation('_evict_component_and_detach_lru',
                     node, trigger, target=EvictLayer.DEVICE,
                     tracker=result.tracker, device_frees=result.device_frees,
-                    host_frees=result.host_frees)
-                core._cascade_evict(node, trigger, result.tracker,
-                    device_frees=result.device_frees, host_frees=result.host_frees)
+                    host_frees=result.host_frees, cache_actions=getattr(result, 'cache_actions', None))
+                self._native_mutation('_cascade_evict', node, trigger, result.tracker,
+                    device_frees=result.device_frees, host_frees=result.host_frees,
+                    cache_actions=getattr(result, 'cache_actions', None))
                 core.kv_events.record_remove(node, medium=StorageMedium.GPU)
                 core._update_evictable_leaf_sets(node.parent)
                 self._read_ownership['hbm_structural_parents_preserved'] += 1
@@ -505,18 +632,20 @@ class NativeHost:
         v=node.component_data[ComponentType.FULL].host_value
         return 0 if v is None else v.numel()
 
-    @staticmethod
-    def _host_only(node): return node.evicted and NativeHost._tokens(node)>0
-
     def _nodes(self):
         yield from (n for n in self.cache.tree_core._node_arena.values() if n is not self.cache.tree_core.root_node)
         yield from self.stage.values()
 
-    def _stage_nodes(self):
-        return tuple(self.stage.values())
-
     def waiting_staging_tokens(self):
-        return sum(e.operation is None for e in self.stage.values())*self.cache.page_size
+        return len(self._waiting_stage_keys)*self.cache.page_size
+
+    def _staging_changed(self, key):
+        entry = self.stage.get(key)
+        if entry is not None and entry.operation is None:
+            self._waiting_stage_keys.add(key)
+        else:
+            self._waiting_stage_keys.discard(key)
+        self.staging_policy.waiting_changed(key)
 
     def _bind_resident_index(self):
         self._host_index.on_key_membership_change = self._resident_key_changed
@@ -530,11 +659,10 @@ class NativeHost:
         return self.staging_policy.index.has_resident_descendant(key)
 
     def resident_keys(self): return set(self._host_index.host_keys)|set(self.stage)
-    def _pending(self,node):
-        if isinstance(node,StagedPage):return node.operation is not None
-        return any(nid==node.id for nid,_ in self.cache.ongoing_backup.values())
     def _copy_bits(self,keys):
-        return [self.ssd_backend.batch_exists([key], None) == 1 for key in keys]
+        # Independent per-key bits use the native single-key predicate.
+        exists=self.ssd_backend.exists
+        return [exists(key) for key in keys]
     def _has_ssd_copy(self,node):
         keys=node.hash_value or []
         return bool(keys) and all(self._copy_bits(keys))
@@ -546,7 +674,7 @@ class NativeHost:
         if self.cfg.get('validate_residency_index'):
             self._validation_checks=getattr(self,'_validation_checks',0)+1
             self._host_index.validate()
-            assert self.absorbed=={e.id for e in self.stage.values()}
+            assert self._waiting_stage_keys == {k for k, e in self.stage.items() if e.operation is None}
             resident = self.resident_keys()
             assert self.staging_policy.index._resident == resident
             expected = set()
@@ -566,11 +694,16 @@ class NativeHost:
                 assert not slots.intersection(values), 'read/staging allocation overlap'
                 slots.update(values)
             native=set(self.cache.tree_core._node_arena)
-            assert not native.intersection(self.absorbed)
+            assert not native.intersection(e.id for e in self.stage.values())
             assert all(e.owner=='staging' and e.payload.numel()==self.cache.page_size for e in self.stage.values())
 
     def _hbm_read_leaf(self, node):
-        """WT host candidate: tree leaf, or optional DRAM leaf; both tiers unlocked."""
+        """WT read-copy candidate; the native Full host/DMA guards apply."""
+        # The (staging + SSD) abstraction assumes the write-through backing
+        # role: a read copy may move to staging, or be released if SSD-backed,
+        # even while HBM retains its copy. Staging policy then controls retention
+        # and SSD admission. This is an ownership rule, not a prefetch-failure
+        # optimization; native lock and child-structure constraints still apply.
         core = self.cache.tree_core
         return (self.cfg.get('stage_hbm_leaves', False)
                 and not self._budget_exhausted()
@@ -580,42 +713,71 @@ class NativeHost:
                     and all(child.component_data[ComponentType.FULL].host_value is None
                             for child in node.children.values())))
                 and core._can_reclaim_full_host_duplicate(node)
-                and all(cd.lock_ref == 0 and cd.host_lock_ref == 0
-                        for cd in node.component_data)
+                # Native duplicate reclamation may release Full host payloads
+                # while HBM is in use. Keep actual host/DMA locks and every aux
+                # pool's lock; the HBM data, locks and tree node remain intact.
+                and all(cd.host_lock_ref == 0 and
+                        (ct == int(ComponentType.FULL) or cd.lock_ref == 0)
+                        for ct, cd in enumerate(node.component_data))
                 and all(cd.host_value is None for ct, cd in enumerate(node.component_data)
                         if ct != int(ComponentType.FULL)))
 
+    def _native_mutation(self, name, *args, cache_actions=None, **kwargs):
+        """Preserve native eviction actions across the old/new tree APIs."""
+        method = getattr(self.cache.tree_core, name)
+        if not getattr(self, '_native_cache_action_api', False):
+            return method(*args, **kwargs)
+        actions = cache_actions
+        if actions is None:
+            actions = getattr(self, '_eviction_cache_actions', None)
+        own_actions = actions is None
+        if own_actions:
+            actions = []
+        result = method(*args, cache_actions=actions, **kwargs)
+        if own_actions and actions:
+            self.cache._apply_cache_actions(actions)
+        return result
+
     def _drive_read_leaves(self, num_tokens, tracker, device_frees, host_frees,
                            *, leaf_handler, should_stop):
-        if (not self.cfg.get('stage_hbm_leaves', False)
-                or self._budget_exhausted() or self.cache.tree_core.is_write_back):
+        extended = (self.cfg.get('stage_hbm_leaves', False)
+                    and not self._budget_exhausted() and not self.cache.tree_core.is_write_back)
+        if not extended and getattr(self, '_native_leaf_callback_api', True):
             return self._original_drive_host_eviction(num_tokens, tracker, device_frees,
                 host_frees, leaf_handler=leaf_handler, should_stop=should_stop)
         core = self.cache.tree_core
         self.component._ensure_eviction_strategy()
         candidates = set(core.evictable_host_leaves)
-        candidates.update(n for n in core.full_host_duplicates.values() if self._hbm_read_leaf(n))
+        if extended:
+            candidates.update(n for n in core.full_host_duplicates.values() if self._hbm_read_leaf(n))
         heap = [(self.component.session_ref_eviction_strategy(n), n) for n in candidates]
         heapq.heapify(heap)
         while heap and not should_stop():
             _, node = heapq.heappop(heap)
-            duplicate = self._hbm_read_leaf(node)
+            duplicate = extended and self._hbm_read_leaf(node)
             if node not in core.evictable_host_leaves and not duplicate:
                 continue
             handled = leaf_handler(node)
+            if handled == 'skip_candidate':
+                # Retirement may pin/split this victim. Other heap candidates
+                # remain eligible; this is not a global capacity stop.
+                continue
             if handled is False:
                 break
             if handled is None:
                 if duplicate:
-                    core._release_full_host_duplicate(node, tracker, device_frees, host_frees)
+                    if node.component_data[ComponentType.FULL].lock_ref:
+                        self._read_ownership['locked_hbm_host_releases'] += 1
+                        self._read_ownership['locked_hbm_host_released_tokens'] += int(node.component_data[ComponentType.FULL].host_value.numel())
+                    self._native_mutation('_release_full_host_duplicate', node, tracker, device_frees, host_frees)
                     core.full_host_duplicates.pop(node.id, None)
                     core._update_evictable_leaf_sets(node)
                 else:
-                    core._evict_host_leaf(node, tracker, device_frees, host_frees)
+                    self._native_mutation('_evict_host_leaf', node, tracker, device_frees, host_frees)
             # Host removal can expose a DRAM leaf while the HBM subtree remains.
             # Recheck eligibility on pop too: a new host child must block it.
             if node.parent is not None and (node.parent in core.evictable_host_leaves
-                                             or self._hbm_read_leaf(node.parent)):
+                                             or (extended and self._hbm_read_leaf(node.parent))):
                 heapq.heappush(heap, (self.component.session_ref_eviction_strategy(node.parent), node.parent))
 
     def _take_read_leaf(self,node):
@@ -626,7 +788,15 @@ class NativeHost:
             # Ownership transfer is not a read access. Native splitting assigns
             # fresh timestamps; preserve the pre-eviction recency on both pieces.
             prior_access=node.last_access_time
-            prefix,action=core._split_node(node.key,node,self._tokens(node)-page)
+            # Native splitting notifies several leaf/duplicate hooks for the
+            # same nodes. Publish our final payload index once, before any
+            # adapter consumer runs; native tree/LRU updates remain immediate.
+            index = self._host_index
+            index.begin_batch()
+            try:
+                prefix,action=core._split_node(node.key,node,self._tokens(node)-page)
+            finally:
+                index.end_batch()
             prefix.last_access_time=node.last_access_time=prior_access
             if action is not None:self.cache._apply_cache_action(action)
         assert self._tokens(node)==page
@@ -637,14 +807,17 @@ class NativeHost:
         self._next_stage_id-=1
         tracker=defaultdict(int);device=defaultdict(list);host=defaultdict(list)
         if self._hbm_read_leaf(node):
-            core._release_full_host_duplicate(node,tracker,device,host)
+            if node.component_data[ComponentType.FULL].lock_ref:
+                self._read_ownership['locked_hbm_staging_transfers'] += 1
+                self._read_ownership['locked_hbm_staging_transferred_tokens'] += page
+            self._native_mutation('_release_full_host_duplicate',node,tracker,device,host)
             core.full_host_duplicates.pop(node.id,None)
             core._update_evictable_leaf_sets(node)
             self._read_ownership['hbm_leaf_transfers'] += 1
             if node.children:self._read_ownership['hbm_internal_transfers'] += 1
             assert core.node_by_id(node.id) is node and not node.evicted
         else:
-            core._evict_host_leaf(node,tracker,device,host)
+            self._native_mutation('_evict_host_leaf',node,tracker,device,host)
         # The native deletion owns all tree/index changes. Its one host free
         # is handed to the overlay, never passed to the allocator's free().
         assert tracker[ComponentType.FULL]==page and not any(device.values())
@@ -655,7 +828,10 @@ class NativeHost:
         key=entry.hash_value[0]
         assert self.stage.get(key) is entry
         if self.capacity_controller:self.capacity_controller.removed(entry)
-        self.stage.pop(key);self.absorbed.discard(entry.id)
+        self.stage.pop(key)
+        if entry.operation is None:
+            self.ssd_backend.release_transition(key)
+        self._staging_changed(key)
         self._staging_return_flush.discard(key)
         self._resident_key_changed(key)
         if free:
@@ -699,57 +875,246 @@ class NativeHost:
         self._finish_read_transfer(entry,result.inserted_host_node)
         return True
 
-    def _choose_stage(self):
-        return self.staging_policy.choose()
-
     @property
     def write_budget_bytes(self):
-        total = self.ssd_backend.validation_cap
-        return None if total is None else total - self.cfg.get('transition_reserve_bytes', 0)
+        return self.ssd_backend.validation_cap
 
     @property
     def budget_charged_bytes(self):
-        # Reporting view of the single SSD counter, not a second budget ledger.
-        return self.ssd_backend.validation_write_bytes - self.staging_return_exempt_bytes
+        return self.ssd_backend.regular_write_bytes
+
+    def _reserve_write_pages(self, keys):
+        if self.ssd_backend.reserve_pages(keys):
+            self._write_cutover_pages=0
+            return True
+        self._write_cutover_pages=max(self._write_cutover_pages,len(set(keys)))
+        return False
+
+    def _unreserved_budget_short(self):
+        needed=getattr(self,'_write_cutover_pages',0)
+        available=self.ssd_backend.remaining_unreserved_pages() if needed else None
+        return available is not None and needed > available
 
     def _budget_exhausted(self):
-        exhausted = getattr(self, '_synced_budget_exhausted', None)
-        if exhausted is None:
-            exhausted = self.ssd_backend.budget_exhausted(self.cfg.get('transition_reserve_bytes', 0))
+        exhausted = self.budget_exhausted_at_s is not None or getattr(self, '_synced_budget_exhausted', False)
+        if not hasattr(self, '_synced_budget_exhausted'):
+            exhausted = (exhausted or self._unreserved_budget_short()
+                         or self.ssd_backend.admission_budget_exhausted())
         if exhausted and self.budget_exhausted_at_s is None:
             self.budget_exhausted_at_s = self.now()
+            # Admission-only can still own a page while its prefix write is
+            # waiting for credits. Its zero staging quota does not exempt it
+            # from the scheduler's ownership handoff.
+            self._budget_return_pending=bool(self.staging_limit or self.stage)
+        if exhausted and self.staging_limit:
+            # The same verdict disables extended eviction and restores read
+            # quota. Pinned physical pages remain allocated until safe to move.
+            self.staging_limit=0
+            self.read_limit=self.total_tokens
         return exhausted
 
 
-    def _retire_staging(self,entry):
+    def _retire_staging(self,entry,*,rejected_on_entry=False):
         if entry.operation is not None or entry.read_pins:return 0
         copied=self._has_ssd_copy(entry)
         if entry.hash_value[0] in self._staging_return_flush:
             if copied:
                 self._remove_stage(entry,free=True);self.staging_exits+=1
                 return self.cache.page_size
-            return self._submit_stage_write(entry,budget_exempt=True)
-        decision=self.staging_policy.retire(entry,copied)
+            return self._submit_stage_write(entry,transition=True)
+        decision=self.staging_policy.retire(entry,copied,rejected_on_entry=rejected_on_entry)
+        if decision.retry or decision.budget_exhausted:
+            # A cutoff never retires untouched staging ownership. The next
+            # scheduler maintenance pass returns these pages or queues their
+            # separately accounted fallback writes.
+            return 0
         if not decision.write:
             if not copied:
                 self.admission_drop_decisions+=1;self.discarded_tokens+=self.cache.page_size
-                if decision.budget_exhausted:self.budget_rejected_tokens+=self.cache.page_size
             if self.capacity_controller and not copied:
                 self.capacity_controller.discarded(entry,decision.budget_exhausted)
             self._remove_stage(entry,free=True);self.staging_exits+=1
             return self.cache.page_size
         return self._submit_stage_write(entry)
 
-    def _submit_stage_write(self,entry,budget_exempt=False):
-        if budget_exempt:
-            self.ssd_backend.allow_transition(entry.hash_value[0])
+    def _pending_prefix_read_releases(self):
+        """Predict frees for submission control only; never allocator capacity.
+
+        Reuse native host-leaf and WT duplicate ownership rules. Other locks,
+        DMA, aux state and children outside this plan stay resident.
+        Only this adapter's in-flight write pins may be discounted in a forecast.
+        """
+        plan = getattr(self, '_prefix_read_release', {})
+        if not plan or self._budget_exhausted():return {}
+        core = self.cache.tree_core
+        if core.is_write_back or not self.cfg.get('stage_hbm_leaves', False):return {}
+        pins = Counter(e.native_lock[0] for e in self.inflight.values()
+                       if e.owner == 'read' and e.native_lock)
+        pending = self.staging_policy._pending_prefix_keys()
+        nodes = {}
+        for nid, (payload, age, hashes) in tuple(plan.items()):
+            node = core._node_arena.get(nid)
+            if (node is None or node.component_data[ComponentType.FULL].host_value is not payload
+                    or node.last_access_time != age or tuple(node.hash_value or ()) != hashes):
+                plan.pop(nid, None)
+                continue
+            nodes[nid] = node
+        result = {}; visited = set()
+        def eligible(node):
+            if node.id in result:return True
+            if node.id in visited:return False
+            visited.add(node.id)
+            cd = node.component_data[ComponentType.FULL]
+            if (node is core.root_node or cd.host_value is None
+                    or node.write_through_pending_id is not None
+                    or node.load_back_pending_id is not None
+                    or cd.host_lock_ref != pins[node.id]
+                    or any(x.host_lock_ref or x.lock_ref or x.host_value is not None
+                           for ct, x in enumerate(node.component_data) if ct != int(ComponentType.FULL))):
+                return False
+            if cd.value is None and (cd.lock_ref or any(x.value is not None for x in node.component_data)):
+                return False
+            if any(not stored and key not in pending
+                   for key, stored in zip(node.hash_value, self._copy_bits(node.hash_value))):return False
+            if node.children:
+                if cd.value is None:
+                    # Native host-only eviction deletes leaves. A parent can
+                    # follow only if each structural child will also be deleted.
+                    if any(child.id not in nodes or not eligible(child)
+                           or child.component_data[ComponentType.FULL].value is not None
+                           for child in node.children.values()):return False
+                else:
+                    if not self.cfg.get('stage_hbm_dram_leaves', False):return False
+                    for child in node.children.values():
+                        if child.component_data[ComponentType.FULL].host_value is not None:
+                            if child.id not in nodes or not eligible(child):return False
+            result[node.id] = node
+            return True
+        for node in nodes.values():eligible(node)
+        return result
+
+    def _release_written_read_prefixes(self):
+        """On ACK, recheck native guards; retain HBM trees, clean host-only leaves natively."""
+        plan = getattr(self, '_prefix_read_release', {})
+        if not plan:return
+        while plan:
+            progress = False
+            for nid, node in tuple(self._pending_prefix_read_releases().items()):
+                core = self.cache.tree_core
+                duplicate = self._hbm_read_leaf(node)
+                if not duplicate and not core._is_host_leaf(node):continue
+                if not all(self._copy_bits(node.hash_value)):continue
+                tracker = defaultdict(int); device = defaultdict(list); host = defaultdict(list)
+                if duplicate:
+                    self._native_mutation('_release_full_host_duplicate', node, tracker, device, host)
+                    core.full_host_duplicates.pop(nid, None)
+                    core._update_evictable_leaf_sets(node)
+                else:
+                    self._native_mutation('_evict_host_leaf', node, tracker, device, host)
+                    self._read_ownership['prefix_read_host_only_released_nodes'] += 1
+                assert not any(device.values()), 'prefix release must never free HBM'
+                self.cache._drain_host_frees(host)
+                self._read_ownership['prefix_read_released_nodes'] += 1
+                self._read_ownership['prefix_read_released_tokens'] += tracker[ComponentType.FULL]
+                plan.pop(nid, None); progress = True
+            if not progress:break
+        # Remaining locks/children or failed copies mean copy-only, not a
+        # deferred right to evict this payload after an unrelated future access.
+        if not any(e.owner == 'read' and e.native_lock for e in self.inflight.values()):
+            self._read_ownership['prefix_read_copy_only_nodes'] += len(plan)
+            plan.clear()
+
+    def persist_prefixes(self, prefix_keys, *, head_key):
+        """Persist ancestors in order; read payloads stay native and LRU is unchanged."""
+        events = self.staging_policy._prefix_events
+        missing = prefix_keys
+        for retry in (False, True):
+            pending = self.staging_policy._pending_prefix_keys()
+            missing = [key for key, stored in zip(missing, self._copy_bits(missing))
+                       if not stored and key not in pending]
+            if any(key in self.stage for key in missing):
+                return 'retry'
+            if not retry:
+                events['admitted_heads'] += 1
+            sources = {}
+            absent = []
+            for key in missing:
+                nodes = self._host_index.key_nodes.get(key)
+                if nodes:
+                    sources[key] = self._host_index.nodes[next(iter(nodes))]
+                else:
+                    absent.append(key)
+            if not absent:
+                break
+            # A successful native backup is not proof that every requested hash
+            # is now host-visible: native eviction may have reclaimed a payload.
+            # Re-resolve once, then yield without discarding the staging tail.
+            if retry:
+                events['native_backup_not_visible_retries'] += 1
+                return 'retry'
+            # Only absent host payloads need the native device->host backup path.
+            wanted=set(absent)
+            device_nodes={k:n for n in self.cache.tree_core._node_arena.values()
+                          for k in n.hash_value or () if k in wanted
+                          and n.component_data[ComponentType.FULL].value is not None}
+            unavailable=[k for k in absent if k not in device_nodes]
+            if unavailable:
+                events['unavailable_prefix_chains'] += 1
+                raise RuntimeError(
+                    "staging prefix invariant violated: required prefix is absent "
+                    "from SSD, in-flight writes, staging, read and HBM; "
+                    f"missing={unavailable}")
+            seen=set()
+            for key in absent:
+                node=device_nodes[key]
+                if node.id not in seen:
+                    seen.add(node.id)
+                    if not self.cache.backup_node_for_write_back(node.id):
+                        events['native_backup_retries'] += 1
+                        return 'retry'
+            # Native backup can split nodes or change host ownership; resolve
+            # sources afresh instead of keeping stale payload addresses.
+        if not self._reserve_write_pages((*missing,head_key)):
+            return 'retry'
+        # Register whole native source nodes, once, before queuing page writes.
+        # All of a node's pages must be SSD-backed/in-flight before it receives
+        # any forecast credit; partial prefix copies cannot release a whole node.
+        if self.cfg.get('stage_hbm_leaves', False) and self.staging_limit:
+            plan = self._prefix_read_release
+            for node in sources.values():
+                cd = node.component_data[ComponentType.FULL]
+                plan.setdefault(node.id, (cd.host_value, node.last_access_time, tuple(node.hash_value)))
+        positions={key:i for i,key in enumerate(prefix_keys)}
+        page = self.cache.page_size
+        for key in missing:
+            source = sources[key]
+            # The write receipt retains the native I/O pin until storage ACK.
+            offset = source.hash_value.index(key)
+            page_slice = slice(offset * page, (offset + 1) * page)
+            lock = (source.id, self.cache.inc_host_lock_ref(source.id).to_dec_params())
+            entry = StagedPage(self._next_stage_id, source.key[page_slice], [key],
+                               source.component_data[ComponentType.FULL].host_value[page_slice],
+                               source.last_access_time, tuple(prefix_keys[:positions[key]]),
+                               owner='read', native_lock=lock)
+            self._next_stage_id -= 1
+            try:
+                self._submit_stage_write(entry)
+            except BaseException:
+                self.cache.dec_host_lock_ref(*lock)
+                raise
+            events['immediate_read_prefix_pages'] += 1
+        return 'ready'
+
+    def _submit_stage_write(self,entry,transition=False):
         assert entry.operation is None and not self._has_ssd_copy(entry)
-        if budget_exempt:
-            assert entry.hash_value[0] in self._staging_return_flush, 'exemption only for blocked staging return'
-        entry.capacity_sample = self.capacity_controller.write_sample(entry) if self.capacity_controller and not budget_exempt else None
-        entry.transition_write = budget_exempt
+        if transition:
+            assert entry.hash_value[0] in self._staging_return_flush, 'fallback only for blocked staging return'
+            if not self.ssd_backend.allow_transition(entry.hash_value[0]):
+                raise RuntimeError('failed to classify a blocked staging return')
+        entry.capacity_sample = self.capacity_controller.write_sample(entry) if self.capacity_controller and entry.owner=='staging' and not transition else None
         op=self.cache.cache_controller.write_storage(entry.payload,entry.key.raw_token_ids(),entry.hash_value,list(entry.prefix_hashes))
         entry.operation=op;self.inflight[op]=entry
+        self._staging_changed(entry.hash_value[0])
         # Native queues perform the write and consume its ACK. The negative
         # owner ID dispatches only the staging receipt at the unlock boundary.
         self.cache.ongoing_backup[op]=(entry.id,None)
@@ -776,8 +1141,6 @@ class NativeHost:
                  ssd_completed_GB=None if timeline is None else timeline.completed_bytes/1e9,
                  read_target_GB=self.read_limit*self.kv_bytes_per_token/1e9,
                  staging_target_GB=self.staging_limit*self.kv_bytes_per_token/1e9,
-                  write_buffer_target_GB=0,
-                  write_buffer_used_GB=0,
                   waiting_staging_used_GB=self.waiting_staging_tokens()*self.kv_bytes_per_token/1e9,
                  meaning='Used budget reads the shared SSD successful-write counter; HiSim writes complete immediately.')
         path=Path(filename)
@@ -788,16 +1151,15 @@ class NativeHost:
     def _attach_write_ack(self):
         original=self.cache.dec_host_lock_ref
         def finish(node_id,params):
+            self.staging_policy.invalidate_round()
             if node_id>=0:return original(node_id,params)
             entry=next((e for e in self.inflight.values() if e.id==node_id),None)
             if entry is None:raise RuntimeError('unknown staging write receipt')
             op=entry.operation;self.inflight.pop(op);entry.operation=None
+            self._staging_changed(entry.hash_value[0])
             if self.capacity_controller and self._has_ssd_copy(entry):
                 self.capacity_controller.wrote(getattr(entry,"capacity_sample",None))
             entry.capacity_sample=None
-            if getattr(entry, 'transition_write', False) and self._has_ssd_copy(entry):
-                self.staging_return_exempt_bytes += self.cache.page_size*self.kv_bytes_per_token
-            entry.transition_write = False
             if getattr(entry, 'copy_committed', False):
                 if self._has_ssd_copy(entry):self.ssd_written_tokens+=self.cache.page_size
                 else:self.ssd_write_failures+=1
@@ -805,25 +1167,45 @@ class NativeHost:
                 return
             if not self._has_ssd_copy(entry):
                 self.ssd_write_failures+=1
-                if entry.owner=='read' and entry.native_lock:original(*entry.native_lock);entry.native_lock=None
+                if entry.owner == 'staging' and entry.hash_value[0] in self._staging_return_flush:
+                    # Use the scheduler's failure path. A rank-local retry can
+                    # reorder the native write receipts across the TP group.
+                    raise RuntimeError(f"SSD write failed during staging budget fallback for {entry.hash_value[0]}")
+                if entry.owner=='read':
+                    self.ssd_backend.release_transition(entry.hash_value[0])
+                    if entry.native_lock:original(*entry.native_lock);entry.native_lock=None
+                self._release_written_read_prefixes()
                 return
-            if getattr(self,'staging_policy',None) is not None:self.staging_policy.complete_prefix_write(entry)
             self.ssd_written_tokens+=self.cache.page_size
             if entry.owner=='read':
                 if entry.native_lock:original(*entry.native_lock);entry.native_lock=None
+                self._release_written_read_prefixes()
                 return
-            if entry.read_pins:return
+            if entry.read_pins:
+                if entry.hash_value[0] in self._staging_return_flush:
+                    entry.fallback_write_committed = True
+                return
             # An eviction write is complete. Native storage already owns its
             # copy; release the source unless an actual read still holds it.
             # Completion itself is not a read or a reason to reinsert into LRU.
             self._remove_stage(entry,free=True);self.overlay_write_releases+=1;self.staging_exits+=1
         self.cache.dec_host_lock_ref=finish
 
-    def _drive_host_eviction(self,required_free,tracker,device_frees,host_frees):
-        if not self.storage_active():
-            return self._original_drive_host_eviction(required_free,tracker,device_frees,host_frees)
-        if self._in_drive:return
+    def _drive_host_eviction(self,required_free,tracker,device_frees,host_frees,cache_actions=None):
+        storage_active=self.storage_active()
+        if storage_active and self._in_drive:return
+        exhausted=storage_active and self._budget_exhausted()
+        if exhausted and self._budget_return_pending and not self._budget_return_started:
+            # Preserve read anchors until the scheduler has classified the
+            # staged pages. Subsequent read reclaims are safe with deferred
+            # staging pages retained by the scheduler's handoff.
+            return
+        if not storage_active or exhausted:
+            kwargs = {} if cache_actions is None else dict(cache_actions=cache_actions)
+            return self._original_drive_host_eviction(required_free,tracker,device_frees,host_frees,**kwargs)
         self._in_drive=True
+        previous_actions = getattr(self, '_eviction_cache_actions', None)
+        self._eviction_cache_actions = cache_actions
         target=self.read_available()+required_free
         # In-flight writes retain their physical source but no longer consume
         # the waiting-residency quota. Count their future frees only for limiting
@@ -832,27 +1214,44 @@ class NativeHost:
                           for e in self.inflight.values())
         pending_free=sum(self.cache.page_size for e in self.inflight.values()
                          if self.stage.get(e.hash_value[0]) is e and not e.read_pins)
-        def retire(entry):
+        def retire(entry, **kwargs):
             nonlocal pending_pages,pending_free
             was_pending=entry.operation is not None
-            freed=self._retire_staging(entry)
+            freed=self._retire_staging(entry,**kwargs)
             if not was_pending and entry.operation is not None:
                 pending_pages+=1
                 if not entry.read_pins:pending_free+=self.cache.page_size
             tracker[ComponentType.FULL]+=freed
+            return freed
         def waiting_tokens():
             return (len(self.stage)-pending_pages)*self.cache.page_size
         def enough():
+            if self._budget_exhausted():return True
             deferred=sum(v.numel() for v in host_frees.get(ComponentType.FULL,()))
-            eventual=min(self._physical_available()+deferred+pending_free,
-                         self.read_limit-self.read_allocated(deferred))
-            return eventual>=target and self.read_allocated(deferred)<=self.read_limit
+            prefix_free = sum(self._tokens(node) for node in self._pending_prefix_read_releases().values())
+            self._read_ownership['prefix_read_forecast_peak_tokens'] = max(
+                self._read_ownership['prefix_read_forecast_peak_tokens'], prefix_free)
+            eventual=min(self._physical_available()+deferred+pending_free+prefix_free,
+                         self.read_limit-self.read_allocated(deferred)+prefix_free)
+            enough_space = eventual>=target and self.read_allocated(deferred)-prefix_free<=self.read_limit
+            if enough_space and prefix_free:self._read_ownership['prefix_read_forecast_stops'] += 1
+            return enough_space
         def stage_leaf(node):
+            if self._budget_exhausted():return False
             if not self.staging_policy.accepts_staging(node):
                 self.read_releases+=1
                 return None
+            # A rejectable incoming tail needs no waiting-residency slot.
+            # Resolve it before displacing a page that still benefits from waiting.
+            if self.staging_policy.discard_on_entry(node):
+                entry=self._take_read_leaf(node)
+                self.storage.put(entry)
+                freed=retire(entry,rejected_on_entry=True)
+                assert freed==self.cache.page_size, 'rejected read tail did not release its page'
+                self.staging_pressure["discard_on_entry"]+=1
+                return True
             while waiting_tokens()>=max(self.cache.page_size,self.staging_limit):
-                entry=self._choose_stage()
+                entry=self.staging_policy.choose()
                 if entry is None:
                     self.staging_pressure['no_stage_candidate']+=1
                     return False
@@ -863,22 +1262,41 @@ class NativeHost:
                     return False
                 self.staging_pressure['pre_retire']+=1
                 if enough():return False
+            # Retiring staging may persist this read prefix and acquire a native
+            # I/O pin, split its path, or exhaust the budget. The heap-pop check
+            # preceded those operations; validate again at ownership transfer.
+            core=self.cache.tree_core
+            if node not in core.evictable_host_leaves and not self._hbm_read_leaf(node):
+                self._read_ownership['read_candidate_changed_during_retire'] += 1
+                if node.component_data[ComponentType.FULL].host_lock_ref:
+                    self._read_ownership['read_candidate_pinned_during_retire'] += 1
+                return 'skip_candidate'
+            # Prefix completion may also have supplied the SSD copy after the
+            # initial admission check. Native eviction now owns this candidate.
+            if not self.staging_policy.accepts_staging(node):
+                self._read_ownership['read_candidate_persisted_during_retire'] += 1
+                self.read_releases+=1
+                return None
             entry=self._take_read_leaf(node)
             self.storage.put(entry)
             if self.staging_limit==0:
                 retire(entry)
             return True
+        self.staging_policy.begin_round()
         try:
-            while waiting_tokens()>self.staging_limit:
-                entry=self._choose_stage()
+            while not self._budget_exhausted() and waiting_tokens()>self.staging_limit:
+                entry=self.staging_policy.choose()
                 if entry is None:break
                 before=(len(self.stage),len(self.inflight))
                 retire(entry)
                 if before==(len(self.stage),len(self.inflight)):break
-            self._drive_read_leaves(required_free,tracker,device_frees,host_frees,
-                                               leaf_handler=stage_leaf,should_stop=enough)
+            if not self._budget_exhausted():
+                self._drive_read_leaves(required_free,tracker,device_frees,host_frees,
+                                                   leaf_handler=stage_leaf,should_stop=enough)
             self._record_peaks()
         finally:
+            self.staging_policy.end_round()
+            self._eviction_cache_actions = previous_actions
             self._in_drive=False
 
     def observe_request(self, req, now):
@@ -923,16 +1341,18 @@ class NativeHost:
         return True
 
     def maintain(self,required_free=0):
+        # Resolve async write completion at a common native TP scheduler round.
+        if getattr(self,'budget_consensus',None) is not None:
+            self.budget_consensus.advance()
         if not self._advance_admission():return 0
         if self.sli.observed_requests:self.staging_policy.maybe_control(self.now())
         consensus=getattr(self,'capacity_consensus',None)
         if consensus is not None:
             consensus.advance()
         else:
-            if self._budget_exhausted() and self.staging_limit:
-                if self.resize_staging(0) is not False:
-                    self._record_budget_progress(force=True,event="staging_disabled_after_exhaustion")
             if self.capacity_controller:self.capacity_controller.tick(self.now())
+        if self._budget_exhausted() and self._budget_return_pending:
+            return_waiting_to_read(self)
         self._record_budget_progress()
         freed=self.cache.evict_host(required_free)
         # Live progress snapshots are observational, not a scheduler decision.
@@ -950,12 +1370,11 @@ class NativeHost:
         # Update both quotas before any eviction; existing SSD copies still use
         # native release, and unmaterialized read victims enter the expanded tier.
         previous=self.staging_limit
-        if previous==target:return True
         exhausted=self._budget_exhausted()
-        if target==0 and exhausted and (getattr(self,'_capacity_zero_blocked',False) or any(e.read_pins or getattr(e,'copy_committed',False) for e in self.stage.values())):
-            return False
+        if exhausted:target=0
+        if previous==target and not self._budget_return_pending:return True
         self.staging_limit=target;self.read_limit=self.total_tokens-target
-        if previous and target==0 and exhausted:
+        if target==0 and exhausted and (previous or self._budget_return_pending):
             return_waiting_to_read(self)
         else:
             # The existing eviction driver first retires staging overflow, then
@@ -994,23 +1413,28 @@ class NativeHost:
         cache.discard_storage_prefetch_accounting=discard
         original_check=cache.check_prefetch_progress
         def check(request):
-            info=cache.ongoing_prefetch.get(request)
-            lease=self.storage.leases.get(id(info.operation)) if info is not None else None
-            has_ssd=lease is not None and len(lease.entries)<len(lease.keys)
-            ready=original_check(request)
-            control.read_progress(request.rid,not ready,self.now(),has_ssd)
+            info = cache.ongoing_prefetch.get(request)
+            lease = self.storage.leases.get(id(info.operation)) if info is not None else None
+            has_ssd = lease is not None and len(lease.entries) < len(lease.keys)
+            ready = original_check(request)
+            now = self.now()
+            control.read_progress(request.rid, not ready, now, has_ssd)
+            current = cache.ongoing_prefetch.get(request) if not ready else None
+            if current is not None and self.storage.physical_ssd_pending(current.operation):
+                observe_physical_wait(control, request, current.operation, now)
             return ready
         cache.check_prefetch_progress=check
 
-    def record_prefetch(self,tokens):self.ssd_prefetched_tokens+=tokens
     def reset(self):
         # Called AFTER native reset, which has cleared the shared host allocator.
         if self.capacity_controller:self.capacity_controller.reset()
         self.storage.reset()
-        self.staging_policy.reset_prefix_obligations()
+        self.staging_policy.reset_prefix_stats()
         self._staging_return_flush.clear()
+        self._budget_return_pending=False
+        self._budget_return_started=False
         self.sli.ready_hashes.clear()
-        self.stage.clear();self.absorbed.clear();self.inflight.clear();self.request_hashes.clear()
+        self.stage.clear();self._waiting_stage_keys.clear();self.inflight.clear();self.request_hashes.clear()
         self._host_index.__init__(self.cache.tree_core,ComponentType.FULL)
         self._next_stats_snapshot_s=0.
         self.staging_policy.index.clear_residents()
@@ -1021,11 +1445,10 @@ class NativeHost:
         fields=('ssd_written_tokens','ssd_write_failures','ssd_prefetched_tokens','staging_exits','read_releases',
                 'duplicate_reclaimed_tokens','demotions','promotions','peak_read_tokens','peak_staging_tokens',
                 'over_limit_events','admission_write_decisions','admission_drop_decisions','discarded_tokens',
-                'staging_reclassified_tokens','persisted_reclaimed_tokens','budget_charged_bytes','budget_rejected_tokens',
-                'storage_unconfirmed_tokens','host_pressure_retries','host_pressure_reclaimed_tokens','host_pressure_write_wait_s',
+                'budget_charged_bytes',
                 'overlay_transfers_in','overlay_transfers_read','overlay_write_returns_read','overlay_write_releases','overlay_backup_reuses')
-        result = dict(staging_pressure=dict(self.staging_pressure),last_transfer_pressure=self.last_transfer_pressure,allocation_progress=dict(self.allocation_progress),staging_return_exempt_bytes=self.staging_return_exempt_bytes,staging_return_pending_pages=len(self._staging_return_flush),total_storage_submitted_bytes=self.ssd_backend.validation_write_bytes,prefix_materialization=self.staging_policy.prefix_write_stats(),unified_storage=self.storage.stats(),budget_exhausted_at_s=self.budget_exhausted_at_s,**{k:getattr(self,k) for k in fields},admission_policy=self.admission_policy,
-                    materialization_timing=self.materialization_timing,write_budget_bytes=self.write_budget_bytes,
+        result = dict(staging_pressure=dict(self.staging_pressure),last_transfer_pressure=self.last_transfer_pressure,allocation_progress=dict(self.allocation_progress),staging_return_pending_pages=len(self._staging_return_flush),total_storage_submitted_bytes=self.ssd_backend.validation_write_bytes,prefix_materialization=self.staging_policy.prefix_write_stats(),unified_storage=self.storage.stats(),budget_exhausted_at_s=self.budget_exhausted_at_s,**{k:getattr(self,k) for k in fields},admission_policy=self.admission_policy,
+                    materialization_timing='on_evict',write_budget_bytes=self.write_budget_bytes,
                     kv_bytes_per_token=self.kv_bytes_per_token,residency_policy=self.residency_policy,
                     candidate_scope='native_read_leaves_external_staging_head_tail',
                     read_tokens=read,staging_tokens=stage,read_limit_tokens=self.read_limit,
@@ -1040,8 +1463,7 @@ class NativeHost:
                     residency_index_validations=getattr(self,'_validation_checks',0),
                     ssd_backend_tokens=len(getattr(self.cache.cache_controller.storage_backend,'storage',{}))*self.cache.page_size,
                     storage_active=self.storage_active(),lifecycle_admission=dict(**self.sli.stats(),**self.staging_policy.stats(),threshold=self.admission_threshold),
-                    storage_execution='hisim_offline',performance_validated=False)
-        result['storage_execution'] = 'native_sglang'
+                    storage_execution='native_sglang',performance_validated=False)
         result['regular_write_bytes'] = self.ssd_backend.regular_write_bytes
         result['transition_write_bytes'] = self.ssd_backend.transition_write_bytes
         return result
@@ -1075,17 +1497,38 @@ def install_storage_adapter(h, backend):
     """Native notifications only; ownership decisions belong to residency."""
     cache, controller, core = h.cache, h.cache.cache_controller, h.cache.tree_core
     pending_commits = None
+    active_read = None
+    transfer = None
+    if ((h.staging_limit or h.cfg.get('dynamic_capacity')) and cache.pp_size == 1
+            and not core.is_eagle and getattr(controller, 'prefetch_buffer', None) is not None):
+        from hohlraum.core.staging_read import StagingReadTransfers
+        transfer = StagingReadTransfers(h, backend)
+        transfer.install()
+    if (cache.pp_size == 1 and not core.is_eagle and cache.host_memory_mode != 'buffer_only'
+            and getattr(controller, 'prefetch_hit_queue', None) is not None
+            and cache.tree_components == (ComponentType.FULL,)):
+        from hohlraum.core.prefetch_reclaim import install_prefetch_reclaim
+        install_prefetch_reclaim(cache, lambda: h.storage_active() and not h._budget_exhausted(),
+                                 h._read_ownership)
     query = controller._storage_hit_query
-    def lookup(operation, *args, **kwargs):
-        keys, tokens = query(operation, *args, **kwargs)
-        backend.begin_read(operation, keys[:tokens // cache.page_size])
-        return keys, tokens
+    if backend._threaded:
+        def lookup(operation, *args, **kwargs):
+            with backend.observe_query_sources() as resident:
+                keys, tokens = query(operation, *args, **kwargs)
+            backend.begin_read(operation, keys[:tokens // cache.page_size], resident)
+            return keys, tokens
+    else:
+        def lookup(operation, *args, **kwargs):
+            keys, tokens = query(operation, *args, **kwargs)
+            backend.begin_read(operation, keys[:tokens // cache.page_size])
+            return keys, tokens
     controller._storage_hit_query = lookup
     if backend._threaded:
         page_get = controller.page_get_func
         def read_batch(operation, *args, **kwargs):
-            # Source accounting only; native reads and TP ACK reduction are unchanged.
             with backend.read_context(operation):
+                if transfer is not None:
+                    return transfer.read_batch(page_get, operation, *args, **kwargs)
                 return page_get(operation, *args, **kwargs)
         controller.page_get_func = read_batch
 
@@ -1093,7 +1536,12 @@ def install_storage_adapter(h, backend):
     insert = core.insert_host
     h._native_insert_host = insert
     def inserted(node_id, key, payload, hashes):
-        result = insert(node_id, key, payload, hashes)
+        if transfer is None or active_read is None:
+            result = insert(node_id, key, payload, hashes)
+        else:
+            indices, replacements = transfer.substitute(active_read, payload, hashes)
+            result = insert(node_id, key, indices, hashes)
+            transfer.commit(result, payload, replacements, hashes)
         if not result.host_insert_dropped:
             if pending_commits is None:
                 backend.confirm_read(hashes)
@@ -1110,9 +1558,10 @@ def install_storage_adapter(h, backend):
 
     handle = cache._handle_prefetch_result
     def result(operation):
-        nonlocal pending_commits
-        assert pending_commits is None
+        nonlocal pending_commits, active_read
+        assert pending_commits is None and active_read is None
         pending_commits = []
+        active_read = operation
         try:
             value = handle(operation)
             backend.confirm_read(pending_commits)
@@ -1120,6 +1569,7 @@ def install_storage_adapter(h, backend):
             return value
         finally:
             pending_commits = None
+            active_read = None
             backend.finish_read(operation)
     cache._handle_prefetch_result = result
 
@@ -1141,6 +1591,21 @@ class ReadLease:
     operation: object
     keys: list
     entries: dict
+    ssd_read_active: bool = False
+    claim: object = None
+    staged_at_query: frozenset = frozenset()
+
+
+def migrate_prefetch_leases(host):
+    """Carry in-flight warmup SSD operations into the staging adapter."""
+    migrated = 0
+    for info in host.cache.ongoing_prefetch.values():
+        operation = info.operation
+        keys = list(operation.hash_value or ())
+        if keys:
+            host.storage.leases[id(operation)] = ReadLease(operation, keys, {})
+            migrated += 1
+    return migrated
 
 
 class StagingStorage:
@@ -1154,9 +1619,6 @@ class StagingStorage:
 
     def __getattr__(self, name):
         return getattr(self.backing, name)
-
-    def ssd_exists(self, keys):
-        return [self.backing.batch_exists([key], None) == 1 for key in keys]
 
     def batch_exists(self, keys, extra_info=None):
         for i, key in enumerate(keys):
@@ -1199,12 +1661,19 @@ class StagingStorage:
         with self.lock:
             self.residency.confirm_read(keys)
 
+    def release_read_claim(self, lease):
+        if lease.claim is not None and self._threaded:
+            for entry in lease.claim.sources.values():
+                self.residency.release_source(entry)
+        lease.claim = None
+
     def finish_read(self, operation):
         with self.lock:
             lease = self.leases.pop(id(operation), None)
             if lease is not None:
                 for entry in lease.entries.values():
                     self.residency.release_source(entry)
+                self.release_read_claim(lease)
 
     def cancel_request(self, rid):
         with self.lock:
@@ -1233,15 +1702,28 @@ class _SGLangStorage(StagingStorage):
         self.pool = residency.cache.cache_controller.storage_host_pool
         self._read_local = threading.local()
 
-    def begin_read(self, operation, keys):
-        # Queries are hints, not ownership changes. In particular, background
-        # query timing must not change the scheduler's eviction candidates.
+    @contextmanager
+    def observe_query_sources(self):
+        previous = getattr(self._read_local, 'query_sources', None)
+        resident = set()
+        self._read_local.query_sources = resident
+        try:
+            yield resident
+        finally:
+            self._read_local.query_sources = previous
+
+    def begin_read(self, operation, keys, staged_at_query=()):
+        # Record source observations without pinning from the query thread.
         with self.lock:
-            self.leases.setdefault(id(operation), ReadLease(operation, list(keys), {}))
+            lease = ReadLease(operation, list(keys), {},
+                              staged_at_query=frozenset(staged_at_query).intersection(keys))
+            self.leases.setdefault(id(operation), lease)
 
     def finish_read(self, operation):
         with self.lock:
-            self.leases.pop(id(operation), None)
+            lease = self.leases.pop(id(operation), None)
+            if lease is not None:
+                self.release_read_claim(lease)
 
     @contextmanager
     def read_context(self, operation):
@@ -1255,28 +1737,61 @@ class _SGLangStorage(StagingStorage):
             self._read_local.lease = previous
 
 
+    def physical_ssd_pending(self, operation):
+        with self.lock:
+            lease = self.leases.get(id(operation))
+            return lease is not None and lease.ssd_read_active
+
+    @contextmanager
+    def _physical_read(self):
+        lease = getattr(self._read_local, 'lease', None)
+        if lease is not None:
+            with self.lock:
+                lease.ssd_read_active = True
+        try:
+            yield
+        finally:
+            if lease is not None:
+                with self.lock:
+                    lease.ssd_read_active = False
+
     def exists(self, key):
         with self.lock:
             if self.residency.contains(key):
+                sources = getattr(self._read_local, 'query_sources', None)
+                if sources is not None:
+                    sources.add(key)
                 return True
         return self.backing.batch_exists([key], None) == 1
 
-
-    def _staged_page(self, key):
+    def _staged_page(self, key, seen_in_staging=False):
         with self.lock:
             entry = self.residency.stage.get(key)
-            if entry is None:
+            if entry is not None:
+                slot = entry.payload[0]
+                counter = 'staging_read_bytes'
+            elif seen_in_staging:
+                # A different request may have moved this source after the
+                # storage query. Read its current host payload by hash.
+                index = self.residency._host_index
+                owners = index.key_nodes.get(key)
+                if not owners:
+                    return None
+                node = index.nodes[next(iter(owners))]
+                offset = node.hash_value.index(key) * self.page_size
+                slot = node.component_data[ComponentType.FULL].host_value[offset]
+                counter = 'promoted_source_read_bytes'
+            else:
                 return None
-            # Clone while protected; the returned CPU copy owns its memory.
-            # No source address or eviction pin survives this critical section.
-            data = self.pool.get_data_page(int(entry.payload[0])).clone()
-            self.events['staging_read_bytes'] += data.numel() * data.element_size()
+            # The returned CPU copy owns its memory after releasing the lock.
+            data = self.pool.get_data_page(int(slot)).clone()
+            self.events[counter] += data.numel() * data.element_size()
             return data
 
     def _read_plan(self, keys):
-        # A page evicted since lookup falls back to SSD (or a normal miss).
-        pages = [self._staged_page(key) for key in keys]
         lease = getattr(self._read_local, 'lease', None)
+        staged = lease.staged_at_query if lease is not None else ()
+        pages = [self._staged_page(key, key in staged) for key in keys]
         if lease is not None:
             sources = {key: page is not None for key, page in zip(keys, pages)}
             with self.lock:
@@ -1299,7 +1814,8 @@ class _SGLangStorage(StagingStorage):
             while end < len(keys) and result[end] is None:
                 end += 1
             dst = None if destinations is None else destinations[i:end]
-            pages = self.backing.batch_get(keys[i:end], dst)
+            with self._physical_read():
+                pages = self.backing.batch_get(keys[i:end], dst)
             if pages is None:
                 pages = [None] * (end-i)
             if len(pages) != end-i:
@@ -1326,8 +1842,9 @@ class _SGLangStorage(StagingStorage):
                 end += 1
             # Zero staging is exactly one native SSD batch, with original
             # destinations, metadata, completion results and native timing.
-            result = self.backing.batch_get_v1(
-                keys[i:end], host_indices[i*self.page_size:end*self.page_size], extra_info)
+            with self._physical_read():
+                result = self.backing.batch_get_v1(
+                    keys[i:end], host_indices[i*self.page_size:end*self.page_size], extra_info)
             if len(result) != end-i:
                 raise RuntimeError('SSD backend returned invalid read result length')
             success[i:end] = result
@@ -1346,13 +1863,16 @@ class _SGLangStorage(StagingStorage):
 
 
 class BudgetStorage:
-    """One per-rank logical write budget, shared by Eager and Hohlraum."""
+    """A per-rank admission budget and separate cutover writes."""
     def __init__(self, backing, cap, page_bytes):
         self.backing = backing
         self.validation_cap = cap
         self.validation_write_bytes = 0
         self.regular_write_bytes = 0
         self.transition_write_bytes = 0
+        self.regular_reservations = set()
+        # A native scheduler round protects the same free credits on all ranks.
+        self.round_credits = None
         self.transition_keys = set()
         self.page_bytes = page_bytes
         self.lock = threading.RLock()
@@ -1360,32 +1880,112 @@ class BudgetStorage:
     def __getattr__(self, name):
         return getattr(self.backing, name)
 
+    def physical_budget_exhausted(self):
+        with self.lock:
+            return (self.validation_cap is not None
+                    and self.validation_write_bytes + self.page_bytes > self.validation_cap)
+
+    def admission_budget_exhausted(self):
+        with self.lock:
+            return (self.validation_cap is not None
+                    and self.regular_write_bytes + self.page_bytes > self.validation_cap)
+
     def budget_exhausted(self, reserve=0):
         with self.lock:
-            return self.validation_cap is not None and self.regular_write_bytes + self.page_bytes > self.validation_cap - reserve
+            reserved = max(reserve, self.regular_reserved_bytes)
+            return (self.validation_cap is not None
+                    and self.regular_write_bytes + reserved + self.page_bytes > self.validation_cap)
+
+    @property
+    def regular_reserved_bytes(self):
+        with self.lock:
+            return len(self.regular_reservations) * self.page_bytes
+
+    def remaining_unreserved_pages(self):
+        """Return whole pages still available, or None without a cap."""
+        with self.lock:
+            if self.validation_cap is None:
+                return None
+            remaining = self.validation_cap - self.regular_write_bytes - self.regular_reserved_bytes
+            return max(0, remaining // self.page_bytes)
+
+    def protect_round_credits(self):
+        with self.lock:
+            self.round_credits = self.remaining_unreserved_pages()
+            return self.round_credits
+
+    def limit_round_credits(self, pages):
+        with self.lock:
+            self.round_credits = pages
+
+    def reserve_pages(self, keys):
+        # Reserve the entire prefix chain before queuing any of its pages.
+        keys = set(keys)
+        with self.lock:
+            if self.validation_cap is None:
+                return True
+            new = keys - self.regular_reservations
+            if self.round_credits is not None:
+                # Debit the same proposed keys on each scheduler rank even when
+                # a local SSD completion already consumed a matching claim.
+                if len(keys) > self.round_credits:
+                    return False
+                self.round_credits -= len(keys)
+            elif len(new) > self.remaining_unreserved_pages():
+                return False
+            self.regular_reservations.update(new)
+            return True
+
+    def reset_budget(self, cap):
+        with self.lock:
+            self.validation_cap = cap
+            self.validation_write_bytes = self.regular_write_bytes = self.transition_write_bytes = 0
+            self.transition_keys.clear()
+            self.regular_reservations.clear()
+            self.round_credits = None
+            self.__dict__.pop('budget_exhausted_at_s', None)
+
+    def release_transition(self, key):
+        """Release any write accounting when a page exits or completes."""
+        with self.lock:
+            self.transition_keys.discard(key)
+            self.regular_reservations.discard(key)
 
     def allow_transition(self, key):
+        """Classify a blocked cutover page before submitting its native write."""
         with self.lock:
-            self.transition_keys.add(key)
+            self.regular_reservations.discard(key)
+            if self.backing.batch_exists([key], None) == 0:
+                self.transition_keys.add(key)
+            return True
 
     def _charge(self, key):
         self.validation_write_bytes += self.page_bytes
         if key in self.transition_keys:
             self.transition_write_bytes += self.page_bytes
-            self.transition_keys.discard(key)
         else:
             self.regular_write_bytes += self.page_bytes
+        self.release_transition(key)
+
+    def _write_page(self, key, write):
+        if self.backing.batch_exists([key], None) == 1:
+            self.release_transition(key)
+            return True
+        additional = 0 if key in self.regular_reservations else self.page_bytes
+        if (key not in self.transition_keys and self.validation_cap is not None
+                and self.regular_write_bytes + self.regular_reserved_bytes +
+                    (self.round_credits or 0) * self.page_bytes + additional > self.validation_cap):
+            return False
+        if not write():
+            return False
+        self._charge(key)
+        return True
 
     def batch_set(self, keys, data, extra_info=None):
         with self.lock:
             for key, page in zip(keys, data):
-                if self.backing.batch_exists([key],None) == 1:
-                    continue
-                if key not in self.transition_keys and self.budget_exhausted():
+                if not self._write_page(key, lambda: self.backing.batch_set([key], [page], extra_info)):
                     return False
-                if not self.backing.batch_set([key], [page], extra_info):
-                    return False
-                self._charge(key)
             return len(keys) == len(data)
 
     def batch_set_v1(self, keys, indices, extra_info=None):
@@ -1395,23 +1995,18 @@ class BudgetStorage:
             page = len(indices)//len(keys)
             result = []
             for i,key in enumerate(keys):
-                if self.backing.batch_exists([key],None) == 1:
-                    result.append(True)
-                    continue
-                if key not in self.transition_keys and self.budget_exhausted():
-                    result.append(False)
-                    continue
-                ok = bool(self.backing.batch_set_v1([key],indices[i*page:(i+1)*page],extra_info)[0])
-                if ok:
-                    self._charge(key)
-                result.append(ok)
+                page_indices = indices[i*page:(i+1)*page]
+                result.append(self._write_page(
+                    key, lambda: self.backing.batch_set_v1([key], page_indices, extra_info)[0]))
             return result
 
 
 def _install_scheduler_hooks():
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers import scheduler
+    Scheduler = scheduler.Scheduler
     if getattr(Scheduler,'_hohlraum_installed',False):
         return
+    install_prefill_observer(scheduler)
     original_input=Scheduler.process_input_requests
     original_next=Scheduler.get_next_batch_to_run
     original_result=Scheduler.process_batch_result
@@ -1433,29 +2028,36 @@ def _install_scheduler_hooks():
         if h is None:return original_next(s,*args,**kwargs)
         with h.lock:
             control=h.capacity_controller
-            if control:control.scheduler_begin(h.now())
             h.maintain()
-            plan=original_next(s,*args,**kwargs)
-            if control:control.scheduler_end(plan.batch_to_run is not None,h.now())
-            return plan
+            try:
+                return original_next(s,*args,**kwargs)
+            finally:
+                if control is not None:
+                    control.read_pressure.finish_round()
     @wraps(original_result)
     def result(s,batch,result,*args,**kwargs):
         h=policy(s)
         if h is None:return original_result(s,batch,result,*args,**kwargs)
         with h.lock:
+            # Native postprocessing may filter or replace batch.reqs. Keep the
+            # submitted request identities until completion references close.
+            requests=tuple(batch.reqs)
+            defer_completion = getattr(s, '_experiment_feedback', False)
+            # Fallback for runtimes or paths without a scheduler completion
+            # timestamp. Sample before native output can reach the client.
+            before_output = h.now() if not defer_completion and getattr(h, '_native_wall_clock', False) else None
             value=original_result(s,batch,result,*args,**kwargs)
-            h.on_batch_complete(batch.reqs,h.now())
-            if h.capacity_controller:h.capacity_controller.batch_completed(result)
+            if defer_completion:
+                h.on_batch_complete(requests, h.now(), defer_completion=True)
+            else:
+                h.on_batch_complete(requests,h.now() if before_output is None else before_output)
             return value
     @wraps(original_run)
     def run(s,batch,*args,**kwargs):
         h=policy(s)
         if h is None or h.capacity_controller is None:return original_run(s,batch,*args,**kwargs)
         with h.lock:
-            h.capacity_controller.batch_launch(h.now())
-            value=original_run(s,batch,*args,**kwargs)
-            h.capacity_controller.batch_submitted(value)
-            return value
+            return original_run(s,batch,*args,**kwargs)
     @wraps(original_abort)
     def aborted(s,req,*args,**kwargs):
         h=policy(s)
@@ -1472,6 +2074,24 @@ def _install_scheduler_hooks():
     Scheduler.run_batch=run
     Scheduler._release_aborted_request=aborted
     Scheduler._hohlraum_installed=True
+
+
+def create_host(cache, cfg, host_class):
+    """Create the runtime adapter for the rank's existing budget and host pool."""
+    controller = cache.cache_controller
+    pool = controller.mem_pool_host.anchor_entry.host_pool
+    page_size = cache.page_size
+    token_bytes = controller.storage_backend.page_bytes // page_size
+    cfg['kv_bytes_per_token'] = token_bytes
+    stage_tokens = int(float(cfg.get('staging_GB', 0)) * 1e9 / cache.tp_world_size / token_bytes)
+    stage_tokens = stage_tokens // page_size * page_size
+    if cfg.get('stats_path'):
+        cfg['stats_path'] += f'.rank{controller.storage_config.tp_rank}.json'
+    cls = type(cache)
+    if not getattr(cls, '_hohlraum_cache_hooks', False):
+        install_cache_hooks(cls)
+        cls._hohlraum_cache_hooks = True
+    return host_class(cache, cfg, int(pool.size), stage_tokens)
 
 
 def attach(cache, filename):
@@ -1491,7 +2111,6 @@ def attach(cache, filename):
     else:
         page_data=controller.storage_host_pool.get_data_page(0)
         token_bytes=page_data.numel()*page_data.element_size()//cache.page_size
-    total=int(pool.size)
     world=cache.tp_world_size
     cap=cfg.get('write_budget_bytes')
     cap=None if cap is None else int(cap)//world
@@ -1500,30 +2119,19 @@ def attach(cache, filename):
     if not cfg.get('enabled',True):return
     if cache.cache_controller.write_policy not in ('write_back', 'write_through'):
         raise ValueError('Native Hohlraum requires write_back or write_through')
-    for key in ('HOHLRAUM_JOINT_MODELS','HOHLRAUM_MODEL_COUNT','HOHLRAUM_ONLINE_PRIOR',
+    for key in ('HOHLRAUM_JOINT_MODELS','HOHLRAUM_MODEL_COUNT','HOHLRAUM_ONLINE_UPDATES',
                 'HOHLRAUM_BRANCH_PRIOR','HOHLRAUM_LENGTH_CURVES'):
         if not os.environ.get(key):
             raise ValueError(f'Native lifecycle policy requires {key}')
     if not Path(cfg['history_library']).is_file():
         raise ValueError('history_library does not exist')
-    cfg['kv_bytes_per_token']=token_bytes
-    cfg.setdefault('reference_history',True)
     cfg.setdefault('admission_policy','agent')
     cfg.setdefault('residency_policy','joint_hts')
     cfg.setdefault('duration_s',14400)
     cfg.setdefault('threshold',0.7)
-    stage=int(float(cfg.get('staging_GB',30))*1e9/world/token_bytes)//cache.page_size*cache.page_size
-    if cfg.get('stats_path'):
-        cfg['stats_path']=cfg['stats_path']+f'.rank{controller.storage_config.tp_rank}.json'
-    cls=type(cache)
-    if not getattr(cls,'_hohlraum_cache_hooks',False):
-        install_cache_hooks(cls)
-        cls._hohlraum_cache_hooks=True
-    if simulated:
-        host_class = HiSimHost
-    else:
-        host_class = NativeHost
-    cache.hohlraum_host=host_class(cache,cfg,total,stage)
+    cfg.setdefault('staging_GB',30)
+    host_class = HiSimHost if simulated else NativeHost
+    cache.hohlraum_host = create_host(cache, cfg, host_class)
     _install_scheduler_hooks()
 
 
@@ -1559,6 +2167,23 @@ class _HiSimStorage(StagingStorage):
             else:
                 ranges.append((start, end, source))
         return tuple(ranges)
+
+    def physical_ssd_pending(self, operation):
+        """Check the current incomplete transfer, including a pure SSD route."""
+        lease = self.leases.get(id(operation))
+        if lease is None or operation.host_indices is None:
+            return False
+        completed = operation.completed_tokens
+        if completed >= len(operation.host_indices):
+            return False
+        route = getattr(operation, '_sim_read_route', None)
+        if route is None:
+            page_index = completed // self.page_size
+            return page_index < len(lease.keys) and page_index not in lease.entries
+        if route.index >= len(route.steps):
+            return False
+        start, end, resource, _, _ = route.steps[route.index]
+        return resource == 'storage_read' and route.progress < end - start
 
     def ssd_spans(self, rid):
         """Stable list shared with the request's statistics adapter."""
@@ -1604,10 +2229,10 @@ class HiSimHost(NativeHost):
                          clock=StateManager.get_global_clock,
                          storage_factory=partial(StagingStorage.create, simulated=True))
 
-    def _drive_host_eviction(self, required_free, tracker, device_frees, host_frees):
+    def _drive_host_eviction(self, required_free, tracker, device_frees, host_frees, cache_actions=None):
         if self._in_drive:
             return
-        super()._drive_host_eviction(required_free, tracker, device_frees, host_frees)
+        super()._drive_host_eviction(required_free, tracker, device_frees, host_frees, cache_actions)
         if not self.inflight:
             return
         # HiSim's existing storage worker completes writes without advancing

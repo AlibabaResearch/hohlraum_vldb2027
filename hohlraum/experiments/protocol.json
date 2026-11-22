@@ -1,24 +1,24 @@
 {
   "seeds": [
-    272015,
-    272016,
-    272017
+    94266,
+    94267,
+    94268
   ],
   "warmup_seconds": 3600,
   "measurement_seconds": 14400,
-  "cold_cache_after_warmup": true,
+  "cold_cache_after_warmup": false,
   "write_budget_bytes": 640000000000,
   "idle_timeout_seconds": 1200,
   "queue_delay_seconds": 10,
-  "waiting_queue_limit": 8,
+  "waiting_queue_limit": 16,
   "ttft_includes_external_wait": true,
   "agentx": {
     "sample_roots": 150,
-    "concurrency": [
-      6,
-      13,
-      22
-    ]
+    "concurrency": {
+      "94266": [6, 28, 36],
+      "94267": [3, 30, 38],
+      "94268": [13, 32, 36]
+    }
   },
   "playing": {
     "sample_roots": 65,
@@ -27,11 +27,11 @@
       65,
       65
     ],
-    "concurrency": [
-      20,
-      32,
-      40
-    ]
+    "concurrency": {
+      "94266": [19, 36, 38],
+      "94267": [19, 34, 38],
+      "94268": [19, 34, 36]
+    }
   },
   "scoring_clock": "client_ready_to_completion_excluded",
   "admission_threshold": 0.7,
@@ -42,7 +42,8 @@
     "history_windows": 8,
     "observation_windows": 2,
     "pressure_windows": 2,
-    "additional_wait_windows": 2,
+    "additional_wait_windows": 1,
+    "exposed_ssd_wait_threshold_s": 2,
     "failure_cooldown_windows": 4,
     "min_read_fraction": 0.25,
     "tiers_gb": [
@@ -63,6 +64,7 @@
       0.05,
       0.1
     ],
-    "min_expansion_windows": 4
+    "min_expansion_windows": 8,
+    "max_expansion_gb": 15
   }
 }

@@ -9,6 +9,8 @@ import json
 import math
 from pathlib import Path
 
+from .read_pressure import ReadPressure
+
 
 class CapacityController:
     def __init__(self, host):
@@ -20,12 +22,13 @@ class CapacityController:
         missing = [k for k in required if c.get(k) is None]
         if missing:
             raise ValueError('capacity_control needs explicitly confirmed parameters: ' + ', '.join(missing))
-        legacy = {'window_s', 'additional_wait_s', 'read_cooldown_s', 'failure_cooldown_s',
-                  'max_step_fraction', 'min_opportunity_fraction', 'preserve_savings_fraction',
-                  'capacity_failure_intervals', 'max_staging_fraction', 'read_wait_floor_s',
-                  'read_wait_growth_ratio', 'read_pressure_intervals'} & c.keys()
-        if legacy:
-            raise ValueError('obsolete capacity parameters: ' + ', '.join(sorted(legacy)))
+        allowed = set(required) | {
+            'period_s', 'history_windows', 'observation_windows', 'min_expansion_windows',
+            'pressure_windows', 'exposed_ssd_wait_threshold_s', 'tiers_gb', 'max_expansion_gb',
+        }
+        unknown = c.keys() - allowed
+        if unknown:
+            raise ValueError('unknown capacity parameters: ' + ', '.join(sorted(unknown)))
         self.period = float(c.get('period_s', 300))
         self.history_windows = int(c.get('history_windows', 8))
         self.observation_windows = int(c.get('observation_windows', 2))
@@ -35,6 +38,9 @@ class CapacityController:
         self.failure_cooldown_windows = int(c['failure_cooldown_windows'])
         self.wait = self.period * self.wait_windows
         self.min_read_fraction = float(c['min_read_fraction'])
+        self.exposed_ssd_wait_threshold_s = float(c.get('exposed_ssd_wait_threshold_s', 2))
+        if not math.isfinite(self.exposed_ssd_wait_threshold_s) or self.exposed_ssd_wait_threshold_s <= 0:
+            raise ValueError('exposed SSD read feedback requires a positive wait threshold')
         self.expansion_thresholds = tuple(map(float, c['expansion_thresholds']))
         self.contraction_thresholds = tuple(map(float, c['contraction_thresholds']))
         self.tiers_gb = tuple(map(float, c.get('tiers_gb', (1, 10, 15, 30))))
@@ -52,6 +58,10 @@ class CapacityController:
             if len(values) != n or any(not math.isfinite(v) or not 0 <= v <= upper for v in values) or any(a >= b for a,b in zip(values,values[1:])):
                 raise ValueError('capacity thresholds must be nonnegative and strictly increasing')
         if self.tiers_gb[0] <= 0:raise ValueError('capacity tier sizes must be positive')
+        expansion_limit = c.get('max_expansion_gb', self.tiers_gb[-1])
+        if expansion_limit not in self.tiers_gb:
+            raise ValueError('max_expansion_gb must match a configured capacity tier')
+        self.max_expansion_tier = self.tiers_gb.index(expansion_limit)
         page=host.cache.page_size
         self.tiers = tuple(max(page, int(gb * 1e9 / getattr(host.cache, 'tp_world_size', 1) / host.kv_bytes_per_token) // page * page) for gb in self.tiers_gb)
         self.maximum = host.total_tokens - math.ceil(host.total_tokens * self.min_read_fraction / page) * page
@@ -71,24 +81,23 @@ class CapacityController:
         self.next_tick=self.window_start+self.period
         self.expand_after=self.epoch_start; self.observe_until=self.epoch_start
         self.capacity_failure_streak=0
+        self._exposed_ssd_wait_pressure_streak = 0
+        self._exposed_ssd_wait_reference_s = None
+        self._last_exposed_ssd_shrink = None
         self.last_shrink=None; self.known_capacity=self.host.staging_limit
         self.last_direction=None
-        self._idle_at=self.host.now(); self._idle_active=False
-        self._idle_since=None; self._idle_seconds=0.; self._idle_longest=0.
-        self._idle_intervals=0; self._idle_total=0.
-        self._checked_ssd_waiters=set(); self._inflight_results=set()
+        self.read_pressure = ReadPressure()
 
     def _clear_interval(self):
-        self._idle_seconds=0.; self._idle_longest=0.; self._idle_intervals=0
-        if self._idle_active:self._idle_since=self._idle_at
+        self.read_pressure.clear()
         self.interval_waits.clear(); self.failure_requests.clear()
         self.capacity_failures.clear(); self.other_failures.clear(); self.writeback_failures.clear()
         self.writeback_failed_tokens=0
 
     def _new_epoch(self, now, direction, pressure_summary=None, tier=None, failure=False):
-        self._advance_idle(now)
         # Keep only a comparison summary, never the old distributions/windows.
-        if direction == 'shrink':
+        hard_shrink = direction == 'shrink' and failure
+        if hard_shrink:
             self.last_shrink=dict(pressure_summary or {}, tier=tier)
         else:
             self.last_shrink=None
@@ -97,6 +106,15 @@ class CapacityController:
         self.next_tick=now+self.period; self.known_capacity=self.host.staging_limit
         self.accepted.clear(); self.slack.clear(); self.states.clear(); self.history.clear()
         self.capacity_failure_streak=0
+        self._exposed_ssd_wait_pressure_streak = 0
+        soft_mean = (pressure_summary or {}).get('sustained_exposed_ssd_wait_mean_s')
+        self._last_exposed_ssd_shrink = ((tier, soft_mean)
+                                         if direction == 'shrink' and not failure and soft_mean is not None
+                                         else None)
+        if direction == 'expand':
+            self._exposed_ssd_wait_reference_s = (pressure_summary or {}).get('pre_expand_exposed_ssd_wait_s')
+        elif direction == 'external':
+            self._exposed_ssd_wait_reference_s = None
         self._clear_interval()
         # Retain live handles for correct completion accounting, but exclude
         # all waiting time accumulated under the previous partition.
@@ -104,7 +122,7 @@ class CapacityController:
         windows=max(self.observation_windows,self.wait_windows,self.min_expansion_windows) if direction == 'expand' else self.observation_windows
         self.observe_until=now+windows*self.period
         self.expand_after=max(self.expand_after,self.observe_until,
-                              now+self.failure_cooldown_windows*self.period if direction == 'shrink' else now)
+                              now+self.failure_cooldown_windows*self.period if hard_shrink else now)
         self._observe_residents(now)
 
     def _observe_residents(self, now):
@@ -116,7 +134,8 @@ class CapacityController:
     def observe(self, entry, profile, now):
         # First observed rejection in the current rejection episode. A return
         # to acceptance invalidates prior slack; threshold changes are included.
-        accepted=profile[0] >= self.host.admission_threshold
+        accepted=(profile[0] >= self.host.admission_threshold
+                  or self.host.sli.pending.get(entry.hash_value[0],0)>0)
         state=self.states.setdefault(entry.id, [False,None])
         if accepted: state[:]=[True,None]
         elif state[0] and state[1] is None: state[1]=now
@@ -129,10 +148,9 @@ class CapacityController:
         key=entry.hash_value[0];now=self.host.now()
         profile=self.host.sli.profiles([key],now)[key]
         self.observe(entry,profile,now)
-        # Forced prefix/pending-read writes still count in the byte denominator,
+        # Pending-read writes still count in the byte denominator,
         # but are not counted as opportunities removable by idle waiting alone.
         eligible=(profile[0]>=self.host.admission_threshold
-                  and not self.host.staging_policy.requires_prefix_write(entry)
                   and not self.host.sli.pending.get(key,0))
         wait=profile[1] if eligible and math.isfinite(profile[1]) else math.inf
         return (now,wait,self.host.cache.page_size*self.host.kv_bytes_per_token,self.epoch)
@@ -151,50 +169,16 @@ class CapacityController:
     def removed(self, entry):
         self.states.pop(entry.id,None)
 
-    def _advance_idle(self, now):
-        elapsed=max(0.,now-self._idle_at)
-        if self._idle_active:
-            self._idle_seconds+=elapsed; self._idle_total+=elapsed
-            self._idle_longest=max(self._idle_longest,max(0.,now-self._idle_since))
-        self._idle_at=now
-
-    def _set_idle(self, active, now):
-        self._advance_idle(now)
-        if active and not self._idle_active:
-            self._idle_since=now; self._idle_intervals+=1
-        elif not active:self._idle_since=None
-        self._idle_active=active
-
-    def scheduler_begin(self, now):
-        self._advance_idle(now)
-        self._checked_ssd_waiters.clear()
-
-    def scheduler_end(self, batch_available, now):
-        # Conservative: an unconsumed result is treated as in-flight even if
-        # the GPU has finished. No CUDA synchronization or timing-model changes.
-        self._set_idle(not batch_available and not self._inflight_results and
-                       bool(self._checked_ssd_waiters & self.waiting.keys()),now)
-
-    def batch_launch(self, now):
-        self._set_idle(False,now)
-
-    def batch_submitted(self, result):
-        self._inflight_results.add(id(result))
-
-    def batch_completed(self, result):
-        self._inflight_results.discard(id(result))
-
     def read_progress(self, rid, waiting, now, has_ssd):
-        if waiting and has_ssd:self._checked_ssd_waiters.add(rid)
-        if waiting and has_ssd:self.waiting.setdefault(rid,now)
-        elif not waiting:self.end_read(rid,now)
+        if waiting and has_ssd:
+            self.waiting.setdefault(rid, now)
+        elif not waiting:
+            self.end_read(rid, now)
 
     def end_read(self, rid, now):
-        self._advance_idle(now)
-        self._checked_ssd_waiters.discard(rid)
-        start=self.waiting.pop(rid,None)
-        if start is not None:self.interval_waits.append(max(0.,now-start))
-        if not self._checked_ssd_waiters & self.waiting.keys():self._set_idle(False,now)
+        start = self.waiting.pop(rid, None)
+        if start is not None:
+            self.interval_waits.append(max(0., now - start))
 
     def failed(self, rid, tokens, reason):
         if tokens>0 and reason in ('host_capacity','storage_transfer','cache_admission_shortfall'):
@@ -216,11 +200,58 @@ class CapacityController:
             bins[bucket]+=size
         return dict(upper_bounds_s=bounds,bytes_by_bin=bins)
 
+    def _contraction_tier(self, retained):
+        tier = sum(retained >= threshold for threshold in self.contraction_thresholds)
+        if len(self.contraction_thresholds) == len(self.tiers):
+            return tier - 1 if retained > 0 else -1
+        return tier
+
+    def _ordinary_contraction_tier(self, accepted_bytes, opportunity, retained):
+        # Low short-TTD demand alone is insufficient. Require observed rejection
+        # slack indicating some writes would still be avoided with less staging.
+        min_growth = next((value for value in self.expansion_thresholds if value > 0), None)
+        min_retained = next((value for value in self.contraction_thresholds if value > 0), None)
+        if (accepted_bytes and min_growth is not None and min_retained is not None
+                and opportunity < min_growth and retained >= min_retained):
+            return self._contraction_tier(retained)
+        return None
+
+    def _pre_expansion_wait_reference(self):
+        windows = [window for window in self.history if window['exposed_ssd_wait_complete']][-2:]
+        if len(windows) < 2:
+            return None
+        return self._pooled_exposed_ssd_wait(windows)
+
+    @staticmethod
+    def _pooled_exposed_ssd_wait(windows):
+        count = sum(window['exposed_ssd_wait_request_count'] for window in windows)
+        exposed = sum(window['exposed_ssd_wait_sum_s'] for window in windows)
+        # Recorded windows without any physical SSD waiters give a zero baseline.
+        return exposed/count if count else 0.
+
+    def _observe_exposed_ssd_pressure(self, exposure, complete):
+        threshold = self.exposed_ssd_wait_threshold_s
+        reference = self._exposed_ssd_wait_reference_s
+        mean = exposure['exposed_ssd_wait_mean_s']
+        if complete and reference is None:
+            # A fixed initial partition can encounter read pressure before expanding.
+            reference = min(mean, threshold) if mean is not None else 0.
+            self._exposed_ssd_wait_reference_s = reference
+        if complete and mean is not None and mean >= threshold and (
+                reference <= threshold or mean > reference):
+            self._exposed_ssd_wait_pressure_streak += 1
+        else:
+            self._exposed_ssd_wait_pressure_streak = 0
+            self._last_exposed_ssd_shrink = None
+        exposure.update(exposed_ssd_wait_reference_s=reference,
+                        exposed_ssd_wait_complete=complete,
+                        exposed_ssd_wait_pressure_streak=self._exposed_ssd_wait_pressure_streak)
+        return self._exposed_ssd_wait_pressure_streak >= self.sustained_intervals
+
     def tick(self, now, *, force=False, synchronize=None):
         # Budget exhaustion may resize storage before this callback.
         if self.host.staging_limit != self.known_capacity:
             self._new_epoch(now, 'external')
-        self._advance_idle(now)
         if not force and now < self.next_tick:return
         complete = now < self.next_tick + self.period
         if not complete:
@@ -232,8 +263,7 @@ class CapacityController:
         # Pending-read duration is diagnostic only; it is NOT overlap-free wait.
         waits=self.interval_waits+[max(0.,now-t) for t in self.waiting.values()]
         mean_wait=sum(waits)/len(waits) if waits else None
-        # Only confirmed capacity-related failures drive capacity control.
-        # Other failures remain observable; they are not assumed to be capacity failures.
+        # Distinguish confirmed capacity failures from general prefetch misses.
         failure=bool(self.capacity_failures or self.writeback_failures)
         self.capacity_failure_streak=self.capacity_failure_streak+1 if complete and failure else 0
         if complete and not failure:self.last_shrink=None
@@ -242,14 +272,12 @@ class CapacityController:
         current_slack=[x for x in self.slack if x[0]>=cutoff]
         summary=dict(mean_wait=mean_wait, capacity_failures=len(self.capacity_failures),
                      writeback_failed_tokens=self.writeback_failed_tokens)
+        exposure = self.read_pressure.stats()
+        exposed_read_pressure = self._observe_exposed_ssd_pressure(exposure, complete and now >= self.next_tick)
         window=dict(start=self.window_start,end=now,complete=complete,epoch=self.epoch,
                     staging_tokens=self.host.staging_limit,accepted_distribution=self._histogram(current_accepted),
                     slack_distribution=self._histogram(current_slack),read_wait_sum_s=sum(waits),read_wait_count=len(waits),
-                    capacity_pressure=failure,
-                    ssd_wait_idle_s=self._idle_seconds,
-                    ssd_wait_idle_fraction=self._idle_seconds/max(now-self.window_start,1e-9),
-                    ssd_wait_idle_longest_s=self._idle_longest,
-                    ssd_wait_idle_intervals=self._idle_intervals,**summary)
+                    capacity_pressure=failure,**summary,**exposure)
         self.history.append(window)
         accepted_bytes=sum(x[2] for x in self.accepted)
         opportunity_bytes=sum(x[2] for x in self.accepted if x[1]<=self.wait)
@@ -259,7 +287,7 @@ class CapacityController:
         retained=safe_bytes/slack_bytes if slack_bytes else 0.
         before=self.host.staging_limit;target=before;reason='hold';tier=None
         failure_pressure=self.capacity_failure_streak>=self.sustained_intervals
-        sustained=failure_pressure
+        sustained=failure_pressure or exposed_read_pressure
         # A resize must physically settle before another allocation change.
         pending=(self.host.read_allocated()>self.host.read_limit or self.host.waiting_staging_tokens()>before)
         if self.host._budget_exhausted():
@@ -267,37 +295,58 @@ class CapacityController:
         elif not complete:
             reason='incomplete_window'
         elif sustained and now>=max(self.observe_until if self.last_shrink is not None else 0, self.epoch_start+self.observation_windows*self.period) and not pending:
-            tier=sum(retained>=v for v in self.contraction_thresholds)
-            if len(self.contraction_thresholds)==len(self.tiers):
-                tier=tier-1 if retained>0 else -1
+            # Confirmed read pressure always reclaims at least the smallest tier.
+            tier = max(0,self._contraction_tier(retained))
             previous=self.last_shrink
-            if previous is not None and previous.get('tier') is not None:
+            if failure_pressure and previous is not None and previous.get('tier') is not None:
                 recent=list(self.history)[-self.sustained_intervals:]
-                no_failure_improvement=(failure_pressure and
+                no_failure_improvement=(
                     (sum(w['capacity_failures'] for w in recent)/len(recent)>=previous.get('capacity_failures',0)) and
                     (sum(w['writeback_failed_tokens'] for w in recent)/len(recent)>=previous.get('writeback_failed_tokens',0)))
                 tier=max(tier,previous['tier'])
                 if no_failure_improvement:tier=max(tier,min(len(self.tiers)-1,previous['tier']+1))
-            target=max(0,before-self.tiers[tier]) if tier>=0 else before
-            if tier<0:
-                # A zero-slack tier must not permanently defeat persistent read
-                # protection. Observe this zero step, then escalate if unimproved.
-                self.last_shrink=dict(summary,tier=-1)
-                self.observe_until=now+self.observation_windows*self.period
-                self.expand_after=now+self.failure_cooldown_windows*self.period
-            reason='writeback_pressure' if self.writeback_failures else 'prefetch_pressure'
+            if not failure_pressure:
+                recent_wait = self._pooled_exposed_ssd_wait(list(self.history)[-self.sustained_intervals:])
+                summary['sustained_exposed_ssd_wait_mean_s'] = recent_wait
+                previous_soft = self._last_exposed_ssd_shrink
+                if previous_soft is not None:
+                    prior_tier, prior_wait = previous_soft
+                    if recent_wait >= prior_wait:
+                        tier=max(tier,min(len(self.tiers)-1,prior_tier+1))
+            target=max(0,before-self.tiers[tier])
+            if failure_pressure:
+                reason='writeback_pressure' if self.writeback_failures else 'prefetch_pressure'
+            else:
+                reason='exposed_ssd_read_pressure'
         elif pending:
             reason='resize_pending'
         elif now<max(self.observe_until,self.expand_after):
             reason='observation'
         elif sustained:
             reason='pressure_at_lower_bound'
+        elif self._exposed_ssd_wait_pressure_streak:
+            reason='observing_exposed_ssd_wait'
         elif sum(w['complete'] for w in self.history)<self.min_expansion_windows:
             reason='collecting_history'
         else:
-            level=sum(opportunity>=v for v in self.expansion_thresholds) if accepted_bytes and opportunity>0 else 0
-            if level:
-                tier=level-1;target=min(self.maximum,before+self.tiers[tier]);reason='write_saving_opportunity'
+            # A single capacity failure can mature into persistent pressure on
+            # the next window. Do not reset that observation with an ordinary shrink.
+            ordinary_tier = self._ordinary_contraction_tier(accepted_bytes, opportunity, retained) if before and not failure else None
+            if ordinary_tier is not None:
+                tier = ordinary_tier
+                target = max(0, before - self.tiers[tier])
+                reason = 'low_ttd_opportunity'
+            else:
+                level=sum(opportunity>=v for v in self.expansion_thresholds) if accepted_bytes and opportunity>0 else 0
+                if level:
+                    tier=min(level-1,self.max_expansion_tier)
+                    target=min(self.maximum,before+self.tiers[tier])
+                    reason='write_saving_opportunity'
+        summary['exposed_ssd_wait_pressure_streak'] = self._exposed_ssd_wait_pressure_streak
+        summary['exposed_ssd_wait_reference_s'] = self._exposed_ssd_wait_reference_s
+        summary['last_exposed_ssd_shrink'] = self._last_exposed_ssd_shrink
+        if target > before:
+            summary['pre_expand_exposed_ssd_wait_s'] = self._pre_expansion_wait_reference()
         if synchronize is not None:
             # All ranks reach this callback in the same scheduler round. The
             # leader chooses the action; local wall-time/sample jitter must not
@@ -311,6 +360,9 @@ class CapacityController:
             self.last_shrink=decision['last_shrink']
             self.observe_until=decision['observe_until'];self.expand_after=decision['expand_after']
             self.capacity_failure_streak=decision['streak']
+            self._exposed_ssd_wait_pressure_streak = summary['exposed_ssd_wait_pressure_streak']
+            self._exposed_ssd_wait_reference_s = summary['exposed_ssd_wait_reference_s']
+            self._last_exposed_ssd_shrink = summary['last_exposed_ssd_shrink']
         applied=True
         if target!=before:applied=self.host.resize_staging(target) is not False
         changed=self.host.staging_limit!=before
@@ -325,11 +377,13 @@ class CapacityController:
             capacity_failure_streak=self.capacity_failure_streak,
             window_count=len(self.history),complete_window_count=sum(w['complete'] for w in self.history),
             min_expansion_windows=self.min_expansion_windows,complete_window=complete)
+        self.last_decision.update(sustained_exposed_ssd_wait_mean_s=summary.get('sustained_exposed_ssd_wait_mean_s'),
+                                  previous_exposed_ssd_shrink=summary['last_exposed_ssd_shrink'])
         self.events[reason]+=1
         if changed:
             direction='expand' if self.host.staging_limit>before else 'shrink'
             if reason=='budget_exhausted':direction='external'
-            self._new_epoch(now,direction,summary,tier,failure_pressure)
+            self._new_epoch(now,direction,summary if applied or direction != 'expand' else None,tier,failure_pressure)
         else:
             self.window_start=now;self.next_tick=now+self.period;self._clear_interval()
         self.last_decision.update(expand_after=self.expand_after,observe_until=self.observe_until,
@@ -339,16 +393,11 @@ class CapacityController:
                 f.write(json.dumps(dict(self.last_decision,window=window),allow_nan=False)+'\n')
 
     def stats(self):
-        self._advance_idle(self.host.now())
-        return dict(ssd_wait_idle_total_s=self._idle_total,
-                    ssd_wait_idle_window_s=self._idle_seconds,
-                    ssd_wait_idle_active=self._idle_active,
-                    ssd_wait_idle_observation_only=True,
-                    observed_inflight_batches=len(self._inflight_results),next_tick=self.next_tick,expand_after=self.expand_after,observe_until=self.observe_until,
+        return dict(next_tick=self.next_tick,expand_after=self.expand_after,observe_until=self.observe_until,
                     events=dict(self.events),last_decision=self.last_decision,epoch=self.epoch,
                     history_windows=len(self.history),accepted_samples=len(self.accepted),slack_samples=len(self.slack),
                     resize_mode='evict_from_shrinking_region',maximum_staging_tokens=self.maximum,
-                    tiers_gb=self.tiers_gb)
+                    tiers_gb=self.tiers_gb,**self.read_pressure.stats())
 
 
 class CapacityConsensus:
@@ -366,7 +415,7 @@ class CapacityConsensus:
     def advance(self):
         h=self.host;c=self.control
         exhausted,blocked=self.reduce_flags(
-            h.ssd_backend.budget_exhausted(h.cfg.get('transition_reserve_bytes',0)),
+            h._unreserved_budget_short() or h.ssd_backend.admission_budget_exhausted(),
             any(e.read_pins or getattr(e,'copy_committed',False) for e in h.stage.values()))
         h._synced_budget_exhausted=bool(exhausted)
         h._capacity_zero_blocked=bool(blocked)
@@ -379,11 +428,24 @@ class CapacityConsensus:
         if due:c.tick(now,force=True,synchronize=self.broadcast)
 
 
-def native_capacity_consensus(control):
-    """Bind only our controller to the native TP CPU process group."""
+class BudgetConsensus:
+    """Publish one budget verdict per scheduler round for fixed partitions too."""
+    def __init__(self, host, reduce_flags):
+        self.host=host;self.reduce_flags=reduce_flags
+        self.host._synced_budget_exhausted=False
+
+    def advance(self):
+        exhausted,_=self.reduce_flags(
+            self.host._unreserved_budget_short()
+            or self.host.ssd_backend.admission_budget_exhausted(),False)
+        self.host._synced_budget_exhausted=bool(exhausted)
+
+
+def _native_consensus_transport(host):
+    """Bind our control messages to the existing native TP CPU process group."""
     import torch
     import torch.distributed as dist
-    group=control.host.cache.tp_group
+    group=host.cache.tp_group
     ranks=dist.get_process_group_ranks(group)
     leader=ranks[0]
     def broadcast(value):
@@ -391,7 +453,22 @@ def native_capacity_consensus(control):
         dist.broadcast_object_list(values,src=leader,group=group)
         return values[0]
     def reduce_flags(exhausted,blocked):
-        flags=torch.tensor([int(exhausted),int(blocked)],dtype=torch.int64)
+        credits=host.ssd_backend.protect_round_credits()
+        unlimited=2**62
+        flags=torch.tensor([int(exhausted),int(blocked),-(unlimited if credits is None else credits)],
+                           dtype=torch.int64)
         dist.all_reduce(flags,op=dist.ReduceOp.MAX,group=group)
-        return flags.tolist()
+        exhausted,blocked,neg_credits=flags.tolist()
+        host.ssd_backend.limit_round_credits(None if -neg_credits==unlimited else -neg_credits)
+        return exhausted,blocked
+    return broadcast,reduce_flags
+
+
+def native_capacity_consensus(control):
+    broadcast,reduce_flags=_native_consensus_transport(control.host)
     return CapacityConsensus(control,broadcast,reduce_flags)
+
+
+def native_budget_consensus(host):
+    _,reduce_flags=_native_consensus_transport(host)
+    return BudgetConsensus(host,reduce_flags)

@@ -1,1 +1,1 @@
-"""Reusable strategy code; real-backend integration remains unvalidated."""
+"""Serving policy and storage integration shared by SGLang and HiSim."""

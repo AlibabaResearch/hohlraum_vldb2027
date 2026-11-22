@@ -116,8 +116,27 @@ class C_HiCacheController(BaseHook):
                     ConfigManager.get_platform_config().disk_read_bandwidth
                 )
 
-            # TODO: Overlap schedule
-            remain_dur = StateManager.get_current_inference_dur()
+            # Multiple event drains at one simulator clock share one transfer
+            # interval. Keep unused credit for newly allocated reads, but never
+            # replenish time merely because the handler is called again.
+            now = StateManager.get_global_clock()
+            if getattr(self, "_sim_read_credit_clock", None) != now:
+                self._sim_read_credit_clock = now
+                self._sim_read_credit_s = max(
+                    0.0, StateManager.get_current_inference_dur()
+                )
+            remain_dur = self._sim_read_credit_s
+
+            def advance_with_credit(operation, tokens, duration):
+                if duration <= 0:
+                    return 0, 0.0
+                completed, spent = prefetch_progress(
+                    self, operation, tokens, duration
+                )
+                self._sim_read_credit_s = max(
+                    0.0, self._sim_read_credit_s - spent
+                )
+                return completed, spent
 
             # Process all operations in the prefetch_queue: place those meeting
             # the prefetch criteria into the sim_prefetch_buffer, and release the
@@ -186,7 +205,7 @@ class C_HiCacheController(BaseHook):
                 else:
                     storage_hit_count = chunked_prefetch_operation["storage_hit_count"]
                     completed_tokens, prefetch_dur = (
-                        prefetch_progress(self, operation,
+                        advance_with_credit(operation,
                             storage_hit_count - operation.completed_tokens, remain_dur)
                     )
                     if (
@@ -234,7 +253,7 @@ class C_HiCacheController(BaseHook):
 
                     storage_hit_count = len(operation.host_indices)
                     completed_tokens, prefetch_dur = (
-                        prefetch_progress(self, operation, storage_hit_count, remain_dur)
+                        advance_with_credit(operation, storage_hit_count, remain_dur)
                     )
                     if completed_tokens < storage_hit_count:
                         # Continue to prefetch data next time.

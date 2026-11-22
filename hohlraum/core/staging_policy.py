@@ -1,20 +1,15 @@
 """Staging policy: HTS candidates and constraints, ranking, and admission."""
 import math
+from bisect import bisect_left, insort
 from collections import Counter, deque
 from dataclasses import dataclass
 from hohlraum.core.sli import StagingRangeIndex
 
 @dataclass(frozen=True)
-class Endpoint:
-    node: object
-    offset: int
-    key: str
-
-
-@dataclass(frozen=True)
 class RetirementDecision:
     write: bool
     budget_exhausted: bool
+    retry: bool = False
 
 
 class StagingPolicy:
@@ -27,11 +22,10 @@ class StagingPolicy:
         self.host = host
         self.cfg = cfg = host.cfg
         self.index = StagingRangeIndex()
-        self.nonleaf_writes = 0
-        self.nonleaf_releases = 0
-        self.cascade_tokens = 0
-        self.prefix_completion_enabled = host.cfg.get('prefix_complete_admission', True)
-        self.reset_prefix_obligations()
+        self._round_active = False
+        self._round_snapshot = None
+        self._waiting_ready = False
+        self.reset_prefix_stats()
         self.selections = 0
         self.histogram = [0] * 100
         self.override_count = 0
@@ -46,41 +40,163 @@ class StagingPolicy:
         """Reject existing SSD copies before transferring read ownership."""
         return not self.host._has_ssd_copy(node)
 
+    def discard_on_entry(self, node):
+        """An already-rejectable tail requires no waiting-residency slot."""
+        h = self.host
+        if h.lifecycle is None or h.admission_policy != "agent" or h.residency_policy != "joint_hts":
+            return False
+        key = node.hash_value[-1]
+        if key not in self.index.key_sessions or h.has_resident_descendant(key):
+            return False
+        keys = [key]
+        now, snapshot = self._ranking_snapshot(h.now())
+        profiles = self._rank_profiles(keys, now, snapshot)
+        if self.decisions_from_profiles(keys, profiles)[0]:
+            return False
+        self.decisions_from_profiles(keys, profiles, record=True)
+        return True
+
     def choose(self):
         host = self.host
+        if (host.residency_policy == 'joint_hts' and host.lifecycle is not None
+                and not host._staging_return_flush):
+            if not any(e.operation is None and not e.read_pins for e in host.stage.values()):
+                return None
+            if not host._budget_exhausted():
+                return self.choose_ranked()
         candidates = [e for e in host.stage.values() if e.operation is None and not e.read_pins]
         if not candidates:
             return None
         returning = [e for e in candidates if e.hash_value[0] in host._staging_return_flush]
         if returning:
             return min(returning, key=lambda e:(len(e.prefix_hashes), e.last_access_time, e.id))
-        marked = [e for e in candidates if self.requires_prefix_write(e)]
-        if marked and not host._budget_exhausted():
-            return min(marked, key=lambda e:(len(e.prefix_hashes), e.last_access_time, e.id))
         if host.residency_policy == 'joint_hts' and host.lifecycle is not None and not host._budget_exhausted():
             return self.choose_ranked()
         return min(candidates, key=lambda e:(e.last_access_time, e.id))
 
-    def choose_ranked(self, deferred=()):
+    def begin_round(self):
+        self._round_active = True
+        self._round_snapshot = None
+        self._waiting_ready = False
+
+    def end_round(self):
+        self._round_active = False
+        self._round_snapshot = None
+        self._waiting_ready = False
+        self.index.waiting.clear()
+
+    def invalidate_round(self):
+        self._round_snapshot = None
+
+    def _ranking_snapshot(self, now):
+        if not self._round_active:
+            return now, None
+        sli = self.host.sli
+        updates = (sli.lib.hh_statistics_updates(sli.ptr)
+                   if hasattr(sli, 'lib') and hasattr(sli.lib, 'hh_statistics_updates') else 0)
+        epoch = (getattr(sli, 'revision', 0), self.host.admission_threshold, updates)
+        snapshot = self._round_snapshot
+        # Strictly less than 0.1s; never let a sliding window extend a snapshot.
+        if (snapshot is None or snapshot['epoch'] != epoch
+                or now < snapshot['time'] or now >= snapshot['time'] + 0.1):
+            snapshot = dict(time=now, epoch=epoch, profiles={}, context={}, position={},
+                            order=[], sortkeys={})
+            self._round_snapshot = snapshot
+        return snapshot['time'], snapshot
+
+    def _rank_profiles(self, keys, now, snapshot):
+        if snapshot is None:
+            return self.host.sli.profiles(keys, now)
+        missing = [key for key in keys if key not in snapshot['profiles']]
+        if missing:
+            snapshot['profiles'].update(self.host.sli.profiles(missing, now))
+        return {key:snapshot['profiles'][key] for key in keys}
+
+    def _rank_risks(self, keys, snapshot):
+        if snapshot is None:
+            return self.host.sli.context_risks(keys), self.host.sli.position_risks(keys)
+        missing = [key for key in keys if key not in snapshot['context']]
+        if missing:
+            snapshot['context'].update(self.host.sli.context_risks(missing))
+            snapshot['position'].update(self.host.sli.position_risks(missing))
+        return ({key:snapshot['context'][key] for key in keys},
+                {key:snapshot['position'][key] for key in keys})
+
+    def _ordered_waiting(self, waiting, weights, snapshot):
+        sortkey = lambda key:(-weights[key],self.host.sli.ids[key])
+        if snapshot is None:
+            return sorted(waiting, key=sortkey)
+        # Preserve stable-sort ties even if several native hashes share a handle.
+        counts = Counter(self.host.sli.ids[key] for key in waiting)
+        current = {key:sortkey(key)+(i if counts[self.host.sli.ids[key]]>1 else 0,key)
+                   for i,key in enumerate(waiting)}
+        previous = snapshot['sortkeys']; order = snapshot['order']
+        for key, value in previous.items():
+            if current.get(key) != value:
+                at = bisect_left(order, value)
+                assert at < len(order) and order[at] == value
+                order.pop(at)
+        for key, value in current.items():
+            if previous.get(key) != value:
+                insort(order, value)
+        snapshot['sortkeys'] = current
+        return [value[-1] for value in order]
+
+    def choose_ranked(self):
         host = self.host
-        now = host.now()
-        candidates = self.candidates(deferred)
+        now, snapshot = self._ranking_snapshot(host.now())
+        roles = self._exit_roles()
+        # A staging entry is always a single page. In-flight writes are
+        # outside the waiting range and pinned pages cannot exit.
+        candidates = [key for key in roles[0] | roles[1]
+                      if (entry := host.stage.get(key)) is not None
+                      and entry.operation is None and not entry.read_pins]
         if not candidates:
             return None
         threshold = host.admission_threshold
-        profiles=host.sli.profiles([ep.key for ep in candidates],now)
-        candidates = [ep for ep in candidates
-                      if not self.protect_head(ep.key, profiles[ep.key][0], threshold)]
+        profiles = self._rank_profiles(candidates, now, snapshot)
+        def accepts(key):
+            return profiles[key][0]>=threshold or host.sli.pending.get(key,0)>0
+        candidates = [key for key in candidates
+                      if not self.protect_head(key, profiles[key][0], threshold)
+                      and self._endpoint_exit_allowed(key, accepts(key), roles)]
         if not candidates:return None
-        candidates.sort(key=lambda ep:(-profiles[ep.key][2],host.sli.ids[ep.key]))
-        candidates=candidates[:(len(candidates)+1)//2]
-        selected=max(candidates,key=lambda ep:(profiles[ep.key][1],-profiles[ep.key][0],host.sli.ids[ep.key]))
+
+        keys = candidates
+        context,position=self._rank_risks(keys,snapshot)
+        # Session context risk and per-KV position risk add in residency
+        # ordering. Admission probabilities and TTD remain unchanged.
+        risks={key:context[key]+position[key] for key in keys}
+        # A combined risk >= 1 has zero survival weight; retain the raw sum
+        # for risk ordering. Context risk 1 already has zero base weight.
+        weights={key:(0. if risks[key]>=1. else
+                      profiles[key][2]*(1-risks[key])/(1-context[key])) for key in keys}
+        # Legal tails already eligible for rejection always reach final HTS
+        # ordering. Risk protects KV that still needs waiting; it must not hide
+        # a discardable tail by reducing its prefilter weight to zero.
+        # Pending reuse still overrides rejection, as in admission.
+        discardable=[key for key in keys if not accepts(key)]
+        waiting=[key for key in keys if accepts(key)]
+        waiting=self._ordered_waiting(waiting,weights,snapshot)
+        candidates=discardable+waiting[:(len(waiting)+1)//2]
+        # Infinite TTD separates discards from writes in the final ordering.
+        def exit_priority(key):
+            score,wait,*_=profiles[key]
+            weight=weights[key]
+            if math.isinf(wait):
+                if not accepts(key):return (wait,1,-score,weight,host.sli.ids[key])
+                # Low risk exits first; probability roundoff must not erase
+                # protection for KV close to a context change.
+                return (wait,0,-risks[key],weight,host.sli.ids[key])
+            return (wait,0,-score,0.,host.sli.ids[key])
+        selected=max(candidates,key=exit_priority)
         self.selections+=1
-        return self.isolate(selected)
+        return host.stage[selected]
 
 
     def decisions(self,keys,now,record=False):
-        return self.decisions_from_profiles(keys,self.host.sli.profiles(keys,now),record)
+        now,snapshot=self._ranking_snapshot(now)
+        return self.decisions_from_profiles(keys,self._rank_profiles(keys,now,snapshot),record)
     def decisions_from_profiles(self,keys,p,record=False):
         out=[]
         for h in keys:
@@ -108,17 +224,48 @@ class StagingPolicy:
         period=self.cfg.get('threshold_period_s',1800.)
         while self.next_tick<=now:self.next_tick+=period
 
-    def retire(self, entry, copied):
+    def retire(self, entry, copied, *, rejected_on_entry=False):
         host = self.host
         over = host._budget_exhausted()
+        # Existing copies and exhausted budgets use cleanup, never new writes.
+        if copied or over or host.admission_policy == 'write_none':
+            return RetirementDecision(False, over)
+        # A rejected read tail enters and exits in the same eviction call.
+        # Its admission observation has already been recorded.
+        if rejected_on_entry:
+            assert self._endpoint_exit_allowed(entry.hash_value[0], False)
+            return RetirementDecision(False, over)
         decisions = self.decisions(entry.hash_value, host.now(), record=True) if host.lifecycle else [True]
-        marked = self.requires_prefix_write(entry)
-        if marked and over:
-            self.record_prefix_budget_block()
-        write = not (copied or host.admission_policy == 'write_none' or over or (not marked and not any(decisions)))
-        if write:
-            self.prepare_tail_write(entry)
-        return RetirementDecision(write, over)
+        accepted = any(decisions)
+        if not self._endpoint_exit_allowed(entry.hash_value[0], accepted):
+            return RetirementDecision(False, over, retry=True)
+        if accepted:
+            status = self.prepare_head_write(entry)
+            if status == 'retry':
+                return RetirementDecision(False, over, retry=True)
+        return RetirementDecision(accepted, over)
+
+    def waiting_changed(self, key):
+        if not self._round_active or not self._waiting_ready:
+            return
+        entry = self.host.stage.get(key)
+        self.index.waiting.set_active(key, entry is not None and entry.operation is None)
+
+    def _exit_roles(self):
+        if self._round_active:
+            if not self._waiting_ready:
+                active = {key:entry for key,entry in self.host.stage.items() if entry.operation is None}
+                self.index.waiting.reset(active)
+                self._waiting_ready = True
+            return self.index.waiting.roles()
+        active={key:entry for key,entry in self.host.stage.items() if entry.operation is None}
+        return self.index.endpoints(active, with_roles=True)
+
+    def _endpoint_exit_allowed(self, key, accepted, roles=None):
+        heads,tails=self._exit_roles() if roles is None else roles
+        if not accepted:
+            return key in tails and not self.host.has_resident_descendant(key)
+        return key in heads
 
     def stats(self):
         return dict(pending_read_overrides=self.override_count,
@@ -128,76 +275,24 @@ class StagingPolicy:
     def observe(self, session, hashes):
         self.index.observe(session, hashes)
 
-    @staticmethod
-    def unlocked(node):
-        return not any(cd.host_lock_ref or cd.lock_ref for cd in node.component_data)
-
-    def candidates(self, deferred=()):
-        host = self.host
-        pages = {}
-        for node in host._stage_nodes():
-            if node.id not in host.absorbed or not host._host_only(node):
-                continue
-            for offset,key in enumerate(node.hash_value or []):
-                pages[key] = Endpoint(node,offset,key)
-        keys = self.index.endpoints(pages)
-        candidates = [pages[k] for k in keys
-                      if pages[k].node.id not in deferred and self.unlocked(pages[k].node)
-                      and not host._pending(pages[k].node)]
-        return candidates
-
-    def isolate(self, endpoint):
-        host=self.host
-        node=endpoint.node
-        page=host.cache.page_size
-        assert endpoint.offset==0 and node.id in host.absorbed, 'HTS only selects standalone staging pages'
-        assert host._tokens(node)==page and node.hash_value==[endpoint.key]
-        return node
-
     def protect_head(self, key, score, threshold):
         """Do not reject a prefix still needed by resident descendants."""
         return score < threshold and self.host.has_resident_descendant(key)
 
-    def reset_prefix_obligations(self):
+    def reset_prefix_stats(self):
         self._prefix_events = Counter()
-        self._required_prefixes = set()
-
-    def record_prefix_budget_block(self):
-        self._prefix_events['marked_pages_blocked_by_budget'] += 1
 
     def _pending_prefix_keys(self):
-        h=self.host
-        keys={k for e in h.inflight.values() for k in e.hash_value}
-        return keys
+        return {k for e in self.host.inflight.values() for k in e.hash_value}
 
-    def requires_prefix_write(self,entry):
-        if not self.prefix_completion_enabled:return False
-        return any(k in self._required_prefixes for k in entry.hash_value)
-
-    def prepare_tail_write(self,tail):
-        if not self.prefix_completion_enabled:return None
-        h=self.host
-        keys=list(tail.prefix_hashes)
-        pending=self._pending_prefix_keys()
-        missing=[k for k,stored in zip(keys,h._copy_bits(keys)) if not stored and k not in pending]
-        self._prefix_events['admitted_suffixes']+=1
-        self._prefix_events['new_prefix_marks']+=len(set(missing)-self._required_prefixes)
-        self._required_prefixes.update(missing)
-        return 'ready'
-
-    def complete_prefix_write(self,entry):
-        if not self.prefix_completion_enabled:return
-        resolved=self._required_prefixes.intersection(entry.hash_value)
-        self._required_prefixes.difference_update(resolved)
-        self._prefix_events['completed_marked_pages']+=len(resolved)
+    def prepare_head_write(self, head):
+        # Only a staging head may be admitted. Copy its missing read ancestors
+        # without evicting read payloads; never force another waiting page out.
+        return self.host.persist_prefixes(head.prefix_hashes, head_key=head.hash_value[0])
 
     def prefix_write_stats(self):
-        if not self.prefix_completion_enabled:return None
-        # Keep failed/pending writes marked. Clear only confirmed stored keys.
-        keys=list(self._required_prefixes)
-        self._required_prefixes.difference_update(k for k,stored in zip(keys,self.host._copy_bits(keys)) if stored)
-        return dict(self._prefix_events,pending_native_tokens=0,outstanding_prefix_marks=len(self._required_prefixes),
-                    semantics='deferred_prefix_marks_subject_to_endurance_budget')
+        return dict(self._prefix_events,
+                    semantics='head_admission_copies_read_prefixes_with_native_async_io')
 
 
     # Dynamic admission: demand tracking and threshold feedback.
@@ -267,7 +362,8 @@ class StagingPolicy:
             else:
                 self._admission_streak = self._admission_streak + 1 if self._admission_pending_target is not None and (self._admission_pending_target > before) == (target > before) else 1
                 self._admission_pending_target = target
-                if self._admission_streak >= 2:
+                # Apply established headroom at this tick; rising pressure still needs confirmation.
+                if direction < 0 or self._admission_streak >= 2:
                     assert -1e-12 <= target <= self._admission_initial + 1e-12
                     after = max(0.0, min(self._admission_initial, target))
                     self._admission_streak = 0
