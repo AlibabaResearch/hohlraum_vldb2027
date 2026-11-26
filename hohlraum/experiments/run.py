@@ -43,6 +43,26 @@ def session_concurrency(protocol,dataset,seed,load_tier,override=None):
     return levels[LOADS.index(load_tier)]
 
 
+def select_capacity_control(protocol, controller=None):
+    if controller is None:
+        return protocol
+    current = protocol.get('capacity_control') or {}
+    if controller == 'throughput':
+        if current.get('mode') != 'throughput' or 'expansion_thresholds' in current:
+            protocol['capacity_control'] = dict(
+                mode='throughput', period_s=60, window_s=300,
+                step_fraction=0.025, min_read_fraction=float(current.get('min_read_fraction', 0.25)),
+            )
+    elif controller == 'tiered':
+        if 'expansion_thresholds' not in current:
+            if 'tiered_capacity_control' not in protocol:
+                raise ValueError('Protocol lacks tiered_capacity_control parameters for --capacity-controller tiered')
+            protocol['capacity_control'] = dict(protocol['tiered_capacity_control'])
+    else:
+        raise ValueError('Unknown capacity controller: ' + str(controller))
+    return protocol
+
+
 def policy_config(policy, protocol, case, library=None, staging_gb=0, *, warmup=False, dynamic_capacity=False):
     """One policy configuration for native and simulated serving."""
     if policy not in ('unlimited', 'budget640', 'admission-dynamic', 'staging'):
@@ -110,9 +130,11 @@ def main():
     p.add_argument('--policies',nargs='+',choices=['unlimited','budget640','admission-dynamic','staging'],default=['unlimited','budget640','admission-dynamic'])
     p.add_argument('--staging-gb',type=float,default=30)
     p.add_argument('--dynamic-capacity',action='store_true',help='Enable capacity controller for staging policy; initial size is --staging-gb')
+    p.add_argument('--capacity-controller',choices=['throughput','tiered'],help='Select capacity controller mode (default: protocol capacity_control, throughput)')
     p.add_argument('--admission-threshold',type=float,help='Explicit threshold override recorded in the protocol')
     p.add_argument('--fixed-admission-threshold',action='store_true',help='Keep the configured threshold constant for a controlled comparison')
     p.add_argument('--uniform-warmup-arrivals',action='store_true',help='Spread initial roots over the warmup hour without changing within-root delays')
+    p.add_argument('--warmup-checkpoint',type=Path,help='Reuse an existing warmup client_checkpoint.json when cold_cache_after_warmup is true')
     p.add_argument('--native-installed-sglang',action='store_true',
                    help='Use the current environment’s SGLang build for native serving')
     p.add_argument('--output',type=Path,required=True)
@@ -131,6 +153,7 @@ def main():
     assets=load(a.assets)
     try:
         protocol=read_serving_protocol(a.protocol)
+        select_capacity_control(protocol,a.capacity_controller)
         if a.seed is None:a.seed=protocol['seeds'][0]
         concurrency=session_concurrency(protocol,a.dataset,a.seed,a.load,a.concurrency)
     except (OSError,ValueError,KeyError,IndexError) as error:p.error(str(error))
@@ -179,7 +202,16 @@ def main():
         call(['c++','-O2','-std=c++17','-shared','-fPIC','-I'+str(ROOT/'hohlraum/core/cpp'),str(ROOT/'hohlraum/core/cpp/sli_bridge.cpp'),'-o',str(library)])
     checkpoint=a.output/'warmup/client_checkpoint.json'
     resident_warmup=not protocol['cold_cache_after_warmup']
-    for label in a.policies if resident_warmup else ['warmup']+a.policies:
+    if a.warmup_checkpoint is not None:
+        if resident_warmup or a.backend!='sglang':
+            p.error('--warmup-checkpoint requires native sglang with cold_cache_after_warmup=true')
+        if not a.warmup_checkpoint.is_file():
+            p.error('Missing warmup checkpoint: '+str(a.warmup_checkpoint))
+        import shutil
+        checkpoint.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copy2(a.warmup_checkpoint,checkpoint)
+    labels = a.policies if (resident_warmup or a.warmup_checkpoint is not None) else ['warmup']+a.policies
+    for label in labels:
         case=a.output/label;warm=label=='warmup';policy='unlimited' if warm else label
         if a.backend=='hisim':
             cmd=[sys.executable,'-m','hohlraum.experiments.backends.hisim.case','prepare','--dataset',a.dataset,'--rows',rows,'--profile',profile_path,'--seed',str(a.seed),'--concurrency',str(concurrency),'--policy',policy,'--staging-gb',str(a.staging_gb),'--output',str(case)]

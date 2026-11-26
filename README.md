@@ -44,8 +44,10 @@ concurrencies, the runner uses that seed's medium arrival plan.
 
 Each load point compares unlimited writes, a 640 GB baseline, admission-only,
 and fixed 30 GB staging. To run dynamic capacity from 30 GB, add
-`--policies staging --staging-gb 30 --dynamic-capacity`. See `./run.sh --help`
-for workload and runtime options.
+`--policies staging --staging-gb 30 --dynamic-capacity` (this uses the unified
+marginal-throughput controller by default; pass `--capacity-controller tiered`
+to select the legacy tiered controller). See `./run.sh --help` for workload and
+runtime options.
 
 Each run starts with empty caches and uses full admission during a one-hour
 warmup. The four-hour measurement retains the warmup KV and resets the write

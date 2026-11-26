@@ -23,12 +23,14 @@ class CapacityController:
         if missing:
             raise ValueError('capacity_control needs explicitly confirmed parameters: ' + ', '.join(missing))
         allowed = set(required) | {
-            'period_s', 'history_windows', 'observation_windows', 'min_expansion_windows',
+            'mode', 'period_s', 'history_windows', 'observation_windows', 'min_expansion_windows',
             'pressure_windows', 'exposed_ssd_wait_threshold_s', 'tiers_gb', 'max_expansion_gb',
         }
         unknown = c.keys() - allowed
         if unknown:
             raise ValueError('unknown capacity parameters: ' + ', '.join(sorted(unknown)))
+        if c.get('mode', 'tiered') != 'tiered':
+            raise ValueError(f"CapacityController requires mode='tiered', got {c.get('mode')!r}")
         self.period = float(c.get('period_s', 300))
         self.history_windows = int(c.get('history_windows', 8))
         self.observation_windows = int(c.get('observation_windows', 2))
@@ -472,3 +474,15 @@ def native_capacity_consensus(control):
 def native_budget_consensus(host):
     _,reduce_flags=_native_consensus_transport(host)
     return BudgetConsensus(host,reduce_flags)
+
+
+def create_capacity_controller(host):
+    c = host.cfg.get('capacity_control') or {}
+    default_mode = 'tiered' if ('expansion_thresholds' in c or 'tiers_gb' in c) else 'throughput'
+    mode = c.get('mode', default_mode)
+    if mode == 'throughput':
+        from .unified_capacity_controller import UnifiedCapacityController
+        return UnifiedCapacityController(host)
+    if mode == 'tiered':
+        return CapacityController(host)
+    raise ValueError(f'unknown capacity_control mode: {mode}')

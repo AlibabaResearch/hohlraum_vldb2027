@@ -415,8 +415,8 @@ class NativeHost:
         self._attach_read_reclaim()
         self._attach_hbm_eviction()
         if cfg.get('dynamic_capacity'):
-            from hohlraum.core.capacity_controller import CapacityController
-            self.capacity_controller=CapacityController(self)
+            from hohlraum.core.capacity_controller import create_capacity_controller
+            self.capacity_controller=create_capacity_controller(self)
             if not os.environ.get('SGLANG_SIMULATOR_CONFIG_PATH') and cache.tp_world_size>1:
                 from hohlraum.core.capacity_controller import native_capacity_consensus
                 self.capacity_consensus=native_capacity_consensus(self.capacity_controller)
@@ -648,12 +648,22 @@ class NativeHost:
         self.staging_policy.waiting_changed(key)
 
     def _bind_resident_index(self):
-        self._host_index.on_key_membership_change = self._resident_key_changed
+        self._host_index.on_key_membership_change = self._on_read_key_changed
         for key in self.resident_keys():
             self.staging_policy.index.set_resident(key, True)
 
+    def _on_read_key_changed(self, key):
+        in_read = key in self._host_index.host_keys
+        self._resident_key_changed(key)
+        control = getattr(self, 'capacity_controller', None)
+        if control is not None:
+            observer = getattr(control, 'observe_read_membership', None)
+            if observer is not None:
+                observer(key, in_read)
+
     def _resident_key_changed(self, key):
-        self.staging_policy.index.set_resident(key, key in self.stage or key in self._host_index.host_keys)
+        in_read = key in self._host_index.host_keys
+        self.staging_policy.index.set_resident(key, key in self.stage or in_read)
 
     def has_resident_descendant(self, key):
         return self.staging_policy.index.has_resident_descendant(key)
@@ -1321,6 +1331,10 @@ class NativeHost:
             if key not in meta:
                 raise ValueError(f'Hohlraum request missing lifecycle field {key}')
         hashes = self.sli.hashes_for_request(req, self.cache.page_size)
+        if self.capacity_controller is not None:
+            observer = getattr(self.capacity_controller, 'observe_request_hits', None)
+            if observer is not None:
+                observer(hashes, now)
         self.staging_policy.observe((meta['root'],meta['owner']),hashes)
         self.request_hashes[req.rid]=hashes
         self.sli.arrive(req,now,hashes)
@@ -2056,8 +2070,23 @@ def _install_scheduler_hooks():
     def run(s,batch,*args,**kwargs):
         h=policy(s)
         if h is None or h.capacity_controller is None:return original_run(s,batch,*args,**kwargs)
-        with h.lock:
+        observer = getattr(h.capacity_controller, 'observe_batch_prefill', None)
+        if observer is None or not getattr(getattr(batch, 'forward_mode', None), 'is_extend', lambda: False)():
             return original_run(s,batch,*args,**kwargs)
+        t0 = h.now()
+        value = original_run(s,batch,*args,**kwargs)
+        dur = max(0.0, h.now() - t0)
+        if dur <= 0.0 and not getattr(h, '_native_wall_clock', True):
+            try:
+                from sglang_simulator.simulation.manager import StateManager
+                dur = float(StateManager.get_current_inference_dur() or 0.0)
+            except Exception:
+                dur = 0.0
+        extend_tokens = int(getattr(batch, 'extend_num_tokens', 0) or 0)
+        if extend_tokens > 0 and dur > 0.0:
+            with h.lock:
+                observer(extend_tokens, dur)
+        return value
     @wraps(original_abort)
     def aborted(s,req,*args,**kwargs):
         h=policy(s)

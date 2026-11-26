@@ -62,6 +62,8 @@ class ReadPressure:
         self.current = {}
         self.waiters = set()
         self.seconds = 0.
+        self.wall_seconds = 0.
+        self._round_wall = 0.
 
     def record(self, rid, route, fits, now):
         self.waiters.add(rid)
@@ -70,15 +72,21 @@ class ReadPressure:
         prior = self.previous.get(rid)
         if prior is not None and prior[0] == route:
             now = max(now, prior[1])
-            self.seconds += now - prior[1]
+            dt = now - prior[1]
+            self.seconds += dt
+            if dt > self._round_wall:
+                self._round_wall = dt
         self.current[rid] = route, now
 
     def finish_round(self):
+        self.wall_seconds += self._round_wall
+        self._round_wall = 0.
         self.previous, self.current = self.current, {}
 
     def stats(self):
         count = len(self.waiters)
         return dict(exposed_ssd_wait_request_count=count, exposed_ssd_wait_sum_s=self.seconds,
+                    exposed_ssd_wall_wait_sum_s=self.wall_seconds,
                     exposed_ssd_wait_mean_s=self.seconds / count if count else None)
 
 

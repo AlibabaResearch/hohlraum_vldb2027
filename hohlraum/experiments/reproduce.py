@@ -220,6 +220,7 @@ def main():
     parser.add_argument('--policies',nargs='+',choices=['unlimited','budget640','admission-dynamic','staging'],default=['unlimited','budget640','admission-dynamic','staging'])
     parser.add_argument('--staging-gb',type=float,default=30)
     parser.add_argument('--dynamic-capacity',action='store_true')
+    parser.add_argument('--capacity-controller',choices=['throughput','tiered'],help='Select capacity controller mode (default: throughput)')
     parser.add_argument('--admission-threshold',type=float)
     parser.add_argument('--fixed-admission-threshold',action='store_true')
     parser.add_argument('--output',type=Path)
@@ -265,10 +266,11 @@ def main():
             raise SystemExit(f'HiSim validation failed: {error}. See {output}') from None
         return
 
-    from hohlraum.experiments.run import LOADS, read_serving_protocol, session_concurrency
+    from hohlraum.experiments.run import LOADS, read_serving_protocol, select_capacity_control, session_concurrency
 
     try:
         protocol=read_serving_protocol(a.protocol)
+        select_capacity_control(protocol,a.capacity_controller)
         seeds=a.seeds or protocol['seeds']
         datasets=a.datasets or ['playing','agentx']
         loads=a.loads or list(LOADS)
@@ -302,6 +304,7 @@ def main():
                  '--concurrency',str(point['concurrency']),'--output',str(case),
                  '--policies',*a.policies,'--staging-gb',str(a.staging_gb)]
             if a.dynamic_capacity:cmd.append('--dynamic-capacity')
+            if a.capacity_controller is not None:cmd+=['--capacity-controller',a.capacity_controller]
             if a.fixed_admission_threshold:cmd.append('--fixed-admission-threshold')
             if a.native_installed_sglang:cmd.append('--native-installed-sglang')
             if a.admission_threshold is not None:cmd+=['--admission-threshold',str(a.admission_threshold)]
